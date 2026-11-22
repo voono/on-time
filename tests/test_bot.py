@@ -36,6 +36,7 @@ class FakeTelegram:
         if self.failures:
             raise self.failures.pop(0)
         self.sent.append(payload)
+        return {'message_id': len(self.sent)}
 
     def ack(self, _):
         pass
@@ -59,11 +60,13 @@ class BotTest(unittest.TestCase):
         self.db = connect(self.path)
         self.bot = Service(self.path, OWNER, self.tg, self.router, lambda: self.now)
 
-    def send(self, text, result=None, *, button=False, actor=OWNER, chat='private', drain=True):
+    def send(self, text, result=None, *, button=False, actor=OWNER, chat='private', drain=True, reply_to=None):
         if result:
             self.router.answers[text] = result
         self.uid += 1
         msg = {'from': {'id': actor}, 'chat': {'id': actor, 'type': chat}, 'text': text}
+        if reply_to is not None:
+            msg['reply_to_message'] = {'message_id': reply_to}
         body = {'callback_query': {'id': str(self.uid), 'from': msg['from'], 'message': msg, 'data': text}} if button else {'message': msg}
         self.last_update = {'update_id': self.uid, **body}
         self.bot.handle(self.db, self.last_update)
@@ -155,7 +158,8 @@ class BotTest(unittest.TestCase):
         m = self.tg.sent[-1]
         self.assertIn('جلسه', m['text'])
         self.assertIn('۱۵:۳۰ تا ۱۵:۵۰', m['text'])
-        self.assertEqual(3, len(m['reply_markup']['inline_keyboard']))
+        self.assertEqual(1, len(m['reply_markup']['inline_keyboard']))
+        self.assertIn('۳.', m['text'])
         self.pick(i, slot=True)
         self.assertIsNone(item_by_id(self.db, i)['due_day'])
         self.at(15, 49)
@@ -170,7 +174,7 @@ class BotTest(unittest.TestCase):
     def test_replacement_and_daily_cap(self):
         a, b = self.task('تماس'), self.task('مطالعه')
         self.send('امروز سعی می‌کنم تماس بگیرم', dict(action='select', target='تماس'))
-        old = self.tg.sent[-1]['reply_markup']['inline_keyboard'][0][0]['callback_data']
+        old = f'done:{self.now.date()}:1'  # A callback from a previously displayed plan.
         self.pick(b)
         self.send(old, button=True)
         self.assertEqual('open', item_by_id(self.db, a)['status'])
@@ -320,8 +324,9 @@ class BotTest(unittest.TestCase):
         self.send('page:1:1',button=True)
         self.assertIn('خرید 0', self.tg.sent[-1]['text'])
         self.send('خرید انجام شد',dict(action='done',target='خرید'))
-        data = self.tg.sent[-1]['reply_markup']['inline_keyboard'][0][0]['callback_data']
-        self.send(data,button=True)
+        self.assertNotIn('reply_markup', self.tg.sent[-1])
+        data = f"match:{pending(self.db)['token']}:{pending(self.db)['ids'][0]}"
+        self.send('اولی')
         self.assertEqual(1,self.db.execute("SELECT COUNT(*) FROM items WHERE status='done'").fetchone()[0])
         self.assertIn('این دکمه', self.send(data,button=True))
 
@@ -421,3 +426,57 @@ class BotTest(unittest.TestCase):
         self.at(9)
         self.assertEqual([m['text'] for m in self.tg.sent].count('⏰ قرص'), 1)
         self.assertIsNone(item_by_id(self.db, 1)['remind_at'])
+
+    def test_text_list_choice_and_completion_without_model(self):
+        first = self.task('نوشتن نامه')
+        self.task('خرید شیر')
+        self.send('/tasks')
+        self.assertIn('۱. خرید شیر', self.tg.sent[-1]['text'])
+        self.assertNotIn('reply_markup', self.tg.sent[-1])
+        self.restart()
+        self.assertIn('نوشتن نامه', self.send('دومی رو برای امروز بذار'))
+        self.assertNotIn('reply_markup', self.tg.sent[-1])
+        self.send('انجامش دادم')
+        self.assertEqual(item_by_id(self.db, first)['status'], 'done')
+        self.assertEqual(len(self.router.calls), 2)
+
+    def test_edit_quoted_reminder_and_continue_in_text(self):
+        self.send('دارو', dict(action='create', kind='reminder', title='قرص', daily=True,
+                              remind=when('0','21:00')))
+        confirmation = len(self.tg.sent)
+        self.task('مطالعه')
+        self.restart()
+        self.send('ساعتش رو بکن ده شب', dict(action='reschedule', target='@',
+                  remind=when('0','22:00')), reply_to=confirmation)
+        self.assertEqual(item_by_id(self.db, 1)['reminder_clock'], '22:00')
+        self.assertIsNone(item_by_id(self.db, 2)['remind_at'])
+        self.send('یادآوریش رو لغو کن', dict(action='cancel_reminder', target='@'))
+        self.assertIsNone(item_by_id(self.db, 1)['remind_at'])
+
+    def test_chat_accepts_time_and_rejects_stale_plan_reply(self):
+        a = self.task('مطالعه')
+        self.task('نامه')
+        self.send('وقت آزاد', dict(action='availability', weekdays=[5],
+                                      windows=[{'start':'12:00','end':'13:00'}]))
+        self.at(8, 30)
+        self.send('همون ساعت خوبه')
+        self.assertIn('مطالعه', self.tg.sent[-1]['text'])
+        self.assertIsNotNone(self.db.execute('SELECT end_at FROM plans').fetchone()[0])
+        previous_plan = len(self.tg.sent)
+        self.pick(2)
+        self.send('انجامش دادم', reply_to=previous_plan)
+        self.assertEqual(item_by_id(self.db, a)['status'], 'open')
+        self.assertEqual(item_by_id(self.db, 2)['status'], 'open')
+
+    def test_ambiguous_pronoun_then_number_and_settings(self):
+        self.task('خرید شیر')
+        self.task('خرید نان')
+        self.send('/tasks')
+        self.send('لغوش کن', dict(action='cancel_item', target='@'))
+        self.assertIn('کدوم',self.tg.sent[-1]['text'])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM items WHERE status='open'").fetchone()[0], 2)
+        self.send('شماره ۲')
+        self.assertEqual(item_by_id(self.db, 1)['status'], 'cancelled')
+        self.assertIn('۰۹:۰۰', self.send('صبح‌بخیر رو ساعت ۹ بفرست',
+                      dict(action='setting', setting='morning', value='09:00')))
+        self.assertIn('۰۹:۰۰', self.send('تنظیمات'))

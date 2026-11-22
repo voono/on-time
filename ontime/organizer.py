@@ -11,12 +11,7 @@ from .store import cancel, enqueue, item_by_id, message, pending, pref, put, set
 
 KINDS = {'task': 'کار', 'note': 'یادداشت', 'event': 'مناسبت', 'reminder': 'یادآوری'}
 HELP = """هرچی توی ذهنت هست بنویس. مثلاً «یه وقت به دندون‌پزشک زنگ بزنم» یا «فردا ساعت ۱۰ یادم بنداز قبض رو بدم».
-برای یادآوری روزانه بنویس «هر روز ساعت ۹ شب یادم بنداز قرصم رو بخورم».
-برای دیدن برنامه بپرس «این هفته چه کارهایی دارم؟»
-/tasks کارهای بی‌موعد · /notes یادداشت‌ها
-/list همهٔ موارد باز · /today امروز · /week این هفته
-/free بازه‌های آزاد · /settings ساعت‌ها و تنظیمات
-/cancel بستن سؤال جاری"""
+بعدش هم می‌تونی بگی «ساعتش رو عوض کن» یا بپرسی «امروز چه کارهایی دارم؟»"""
 
 
 def matches(row, target):
@@ -35,18 +30,24 @@ def active(db):
     return db.execute("SELECT * FROM items WHERE status='open' ORDER BY id DESC").fetchall()
 
 
-def candidate_titles(db, text, now):
+def candidate_titles(db, text, now, context):
+    visible = context.get('ids', [])
     words = {w for w in re.findall(r'[^\W_]+', norm(text)) if len(w) > 2}
     plan = current_plan(db, now.date())
     offered = {r[0] for r in db.execute('SELECT item_id FROM suggestions WHERE day=?', (str(now.date()),))}
     candidates = []
-    for row in db.execute("SELECT id,title,kind FROM items WHERE status='open'"):
+    for row in db.execute("SELECT id,title,kind,due_day,due_clock,remind_at,daily FROM items WHERE status='open'"):
         title = norm(row['title'])
         score = sum(len(w) for w in words if w in title)
         selected = bool(plan and plan['item_id'] == row['id'])
-        if score or selected or row['id'] in offered:
-            candidates.append((score, row['id'], {**dict(row), 'selected_today': selected}))
-    return [data for _, _, data in sorted(candidates, reverse=True)[:12]]
+        if score or selected or row['id'] in offered or row['id'] in visible:
+            position = visible.index(row['id']) + 1 if row['id'] in visible else None
+            candidate = dict(row)
+            if candidate['remind_at'] is not None:
+                candidate['remind_at'] = datetime.fromtimestamp(row['remind_at'], now.tzinfo).isoformat()
+            candidate.update(selected_today=selected, position=position)
+            candidates.append((bool(position), score, row['id'], candidate))
+    return [data for _, _, _, data in sorted(candidates, reverse=True)[:12]]
 
 
 def list_page(db, scope, target, page, now, view=None):
@@ -66,27 +67,28 @@ def list_page(db, scope, target, page, now, view=None):
         if keep or (scope == 'today' and rday == today) or (scope == 'week' and rday and week <= rday < week + timedelta(days=7)):
             found.append((item, d))
     header = []
-    extra_rows = []
+    selected_id = None
     if scope == 'today' and not target:
         plan = current_plan(db, today)
         if plan:
             selected = item_by_id(db, plan['item_id'])
             header = ['انتخاب امروز: ' + selected['title']]
-            extra_rows = [[('انتخاب امروز · جزئیات', f'item:{selected["id"]}')]]
+            selected_id = selected['id']
     if not found and header:
-        return message(header[0], extra_rows)
+        return message(header[0], context={'ids': [selected_id]})
     if not found:
         return message('چیزی با این مشخصات پیدا نکردم.')
     found.sort(key=lambda x: (x[1] is None, str(x[1]), x[0]['due_clock'] or '', -x[0]['id']))
     size = 6
     page = min(max(0, page), (len(found) - 1) // size)
-    rows, lines = extra_rows, header
+    rows, lines, ids = [], header, []
     for item, d in found[page * size:(page + 1) * size]:
         desc = label(d) + (' ' + fa(item['due_clock']) if item['due_clock'] else '') if d else ''
         if item['remind_at']:
             desc += (' · ' if desc else '') + 'یادآوری ' + reminder_label(item, now.tzinfo)
-        lines.append(f'{fa(item["id"])}. {item["title"]}' + (' — ' + desc if desc else ''))
-        rows.append([(f'{KINDS[item["kind"]]} {fa(item["id"])} · جزئیات', f'item:{item["id"]}')])
+        ids.append(item['id'])
+        lines.append(f'{fa(len(ids))}. {item["title"]}' + (' — ' + desc if desc else ''))
+
     if len(found) > size:
         if view is None:
             view = db.execute('INSERT INTO views(scope,target) VALUES (?,?)', (scope, target)).lastrowid
@@ -96,7 +98,9 @@ def list_page(db, scope, target, page, now, view=None):
         if (page + 1) * size < len(found):
             nav.append(('بعدی', f'page:{view}:{page+1}'))
         rows.append(nav)
-    return message('\n'.join(lines), rows)
+    lines.append('شماره یا اسمش رو بگو، مثلاً «جزئیات اولی».')
+    return message('\n'.join(lines), rows, context={'kind': 'list', 'ids': ids, 'view': view, 'page': page,
+                                                     'more': (page + 1) * size < len(found)})
 
 
 def reminder_label(item, zone):
@@ -124,19 +128,7 @@ def detail(db, item, now):
         lines.append('هر سال در تقویم ' + ('شمسی' if item['calendar'] == 'jalali' else 'میلادی'))
     if item['remind_at']:
         lines.append('یادآوری: ' + reminder_label(item, now.tzinfo))
-    rows = []
-    if item['kind'] == 'task':
-        row = [('انجام شد', f'finish:{i}')]
-        if not d:
-            row.append(('انتخاب برای امروز', f'pick:{now.date()}:{i}'))
-        rows.append(row)
-    if item['kind'] in ('task', 'event'):
-        rows.append([('تغییر موعد', f'editdue:{i}')])
-    rows.append([('تنظیم یادآوری', f'editrem:{i}')])
-    if item['remind_at']:
-        rows[-1].append(('لغو یادآوری', f'unrem:{i}'))
-    rows.append([('لغو مورد', f'drop:{i}')])
-    return message('\n'.join(lines), rows)
+    return message('\n'.join(lines), context={'ids': [i]})
 
 
 def local_command(db, text, now):
@@ -152,8 +144,7 @@ def local_command(db, text, now):
     if cmd == '/settings':
         return message(f"صبح‌بخیر: {fa(pref(db,'morning'))} ({'روشن' if pref(db,'enabled')=='1' else 'خاموش'})"
                        f"\nپیگیری: {fa(pref(db,'follow'))}\nمناسبت‌های نزدیک: {fa(pref(db,'near'))} روز"
-                       f"\nمنطقه: {pref(db,'zone')}\n/morning 08:30 یا /morning off"
-                       "\n/followup 19:00\n/near 7\n/tz Asia/Tehran")
+                       f"\nمنطقه: {pref(db,'zone')}\nبرای تغییرش بگو «صبح‌بخیر رو ساعت ۹ بفرست».")
     if cmd == '/near':
         if not arg.isdecimal() or not 0 <= int(arg) <= 365:
             raise ValueError('تعداد روز را بین ۰ و ۳۶۵ بنویس.')
@@ -199,7 +190,15 @@ def local_command(db, text, now):
         return message('\n'.join(lines)[:3900])
     else:
         return message('این دستور را نمی‌شناسم. /help')
-    return message('تنظیمات ذخیره شد.')
+    if cmd == '/morning':
+        if pref(db, 'enabled') == '0':
+            return message('پیام صبح‌بخیر خاموش شد.')
+        return message('صبح‌بخیر رو ساعت ' + fa(pref(db, 'morning')) + ' می‌فرستم.')
+    if cmd == '/followup':
+        return message('ساعت پیگیری شد ' + fa(pref(db, 'follow')) + '.')
+    if cmd == '/tz':
+        return message('منطقهٔ زمانی شد ' + pref(db, 'zone') + '.')
+    return message('مناسبت‌های ' + fa(pref(db, 'near')) + ' روز آینده رو نشون می‌دم.')
 
 
 def ask(db, text, original, intent, now, **extra):
@@ -213,9 +212,11 @@ def ask(db, text, original, intent, now, **extra):
                 draft[field]['day'] = f'{y:04}-{m:02}-{day:02}'
             else:
                 draft[field]['day'] = str(d)
-    set_pending(db, {'original': original, 'at': now.isoformat(), 'draft': draft,
+    seq = int(pref(db, 'question_seq', '0')) + 1
+    put(db, 'question_seq', str(seq))
+    set_pending(db, {'original': original, 'at': now.isoformat(), 'draft': draft, 'question_token': seq,
                      'question': text, **extra})
-    return message(text + '\n/cancel برای انصراف')
+    return message(text, context={'kind': 'question', 'question_token': seq})
 
 
 def save_item(db, intent, original, now, item=None):
@@ -293,15 +294,21 @@ def save_item(db, intent, original, now, item=None):
         text += ' (بی‌موعد)'
     if stamp:
         text += '\nیادآوری: ' + reminder_label(saved, now.tzinfo)
-    return message(text, [[('جزئیات', f'item:{i}')]])
+    return message(text, context={'ids': [i]})
 
 
-def apply_action(db, intent, original, now, item=None):
+def apply_action(db, intent, original, now, item=None, visible=()):
     a = intent.action
     if a == 'clarify' or (intent.question and a not in ('create', 'reschedule')):
         return ask(db, intent.question or 'کدوم کار یا زمان رو می‌گی؟', original, intent, now)
     if a == 'create':
         return save_item(db, intent, original, now)
+    if a == 'setting':
+        if not intent.setting:
+            return local_command(db, '/settings', now)
+        response = local_command(db, '/' + intent.setting + ' ' + intent.value, now)
+        set_pending(db, None)
+        return response
     if a == 'list':
         set_pending(db, None)
         return list_page(db, intent.scope, intent.target, 0, now)
@@ -315,7 +322,7 @@ def apply_action(db, intent, original, now, item=None):
             return ask(db, 'این بازه برای چه روزیه؟', original, intent, now)
         set_windows(db, keys, [(w.start, w.end) for w in intent.windows])
         set_pending(db, None)
-        return message('وقت آزاد ثبت شد. /free')
+        return message('وقت آزادت رو ثبت کردم.')
     p = current_plan(db, now.date())
     if item is None:
         if not intent.target and a in ('done', 'skip', 'later') and p:
@@ -325,7 +332,10 @@ def apply_action(db, intent, original, now, item=None):
                            (str(now.date()),)).fetchone()
             item = item_by_id(db, s[0]) if s else None
         else:
-            candidates = [r for r in active(db) if intent.target and matches(r, intent.target)]
+            if intent.target == '@':
+                candidates = [r for i in visible if (r := item_by_id(db, i)) and r['status'] == 'open']
+            else:
+                candidates = [r for r in active(db) if intent.target and matches(r, intent.target)]
             if a in ('select', 'done', 'skip', 'later'):
                 candidates = [r for r in candidates if r['kind'] == 'task']
             if len(candidates) > 1:
@@ -334,7 +344,9 @@ def apply_action(db, intent, original, now, item=None):
                 put(db, 'choice_seq', str(token))
                 ids = [r['id'] for r in candidates[:12]]
                 set_pending(db, {'original': original, 'draft': intent.model_dump(), 'token': token, 'ids': ids})
-                return message('کدوم مورد رو می‌گی؟', [[(r['title'], f'match:{token}:{r["id"]}')] for r in candidates[:12]])
+                options = [f'{fa(n)}. {r["title"]}' for n, r in enumerate(candidates[:12], 1)]
+                return message('کدوم رو می‌گی؟ شماره یا اسمش رو بگو.\n' + '\n'.join(options),
+                               context={'kind': 'match', 'ids': ids, 'token': token})
             item = candidates[0] if candidates else None
     if not item or item['status'] != 'open':
         return message('مورد بازی با این مشخصات پیدا نکردم.')
@@ -342,6 +354,8 @@ def apply_action(db, intent, original, now, item=None):
     set_pending(db, None)
     if a in ('select', 'accept_slot'):
         return choose(db, now, item, a == 'accept_slot')
+    if a == 'detail':
+        return detail(db, item, now)
     if a == 'reschedule':
         return save_item(db, intent, original, now, item)
     if a == 'cancel_reminder':
@@ -416,16 +430,16 @@ def callback(db, data, now):
     return expired
 
 
-def interpret(db, text, intent, ctx, now):
+def interpret(db, text, intent, ctx, now, visible=()):
     if not ctx or not intent.continuation:
-        return apply_action(db, intent, text, now)
+        return apply_action(db, intent, text, now, visible=visible)
     old = Intent.model_validate(ctx['draft'])
     if 'token' in ctx:
         selected = [i for i in ctx['ids'] if (r := item_by_id(db, i)) and
                     (matches(r, intent.target or text) or str(i) == norm(text))]
         if len(selected) == 1:
             return callback(db, f'match:{ctx["token"]}:{selected[0]}', now)
-        return message('روی دکمهٔ موردی که منظورت بود بزن.')
+        return message('شماره یا اسم موردی که منظورت بود رو بگو.')
     if old.action not in ('create', 'reschedule'):
         return apply_action(db, intent, ctx['original'], now)
     # The earlier turn owns the item and action; the reply supplies missing information.

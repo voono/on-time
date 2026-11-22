@@ -1,9 +1,10 @@
+import json
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from .dates import norm
+from .conversation import conversation_context, shortcut
 from .intent import Intent
 from .organizer import callback, candidate_titles, interpret, local_command
 from .planner import arm, current_plan, morning_due, next_annual, next_daily, reminder_key, scheduled_message
@@ -11,8 +12,6 @@ from .store import connect, enqueue, item_by_id, message, pending, pref, put
 from .transport import DeliveryError
 
 LOG = logging.getLogger(__name__)
-QUICK = {'انجام شد': 'done', 'بذار برای بعد': 'later', 'امروز ردش کن': 'skip',
-         'کارهای بدون موعدم رو نشون بده': 'undated', 'این هفته چه کارهایی دارم؟': 'week'}
 
 
 def incoming(update, owner):
@@ -56,15 +55,24 @@ class Service:
             cb, msg = parsed
             text = msg.get('text', '').strip()
             ctx = pending(db)
+            focus = conversation_context(db, msg)
+            stale_question = False
+            if msg.get('reply_to_message'):
+                if focus.get('kind') in ('question', 'match'):
+                    field = 'token' if focus['kind'] == 'match' else 'question_token'
+                    stale_question = not ctx or focus[field] != ctx.get(field)
+                else:
+                    ctx = None
+            route = None if cb else shortcut(text, focus, ctx)
             if cb:
                 try:
                     self.tg.ack(cb['id'])
                 except DeliveryError:
                     pass
-            elif not text.startswith('/') and norm(text) not in QUICK:
+            elif route is None and not stale_question:
                 try:
                     received = self.local(db)
-                    intent = self.router.parse(text, received, ctx, candidate_titles(db, text, received))
+                    intent = self.router.parse(text, received, ctx, candidate_titles(db, text, received, focus))
                 except Exception as exc:
                     LOG.warning('Intent unavailable (%s)', type(exc).__name__)
                     parse_error = True
@@ -74,23 +82,34 @@ class Service:
                 now = self.local(db)
                 db.execute('SAVEPOINT input')
                 try:
-                    if parse_error:
-                        out = message('الان نتونستم پیام رو بخونم. لطفاً دوباره بفرست. فهرست با /list در دسترسه.')
+                    if stale_question and not cb and not text.startswith('/'):
+                        out = message('این سؤال بسته شده. بگو الان می‌خوای کدوم کار رو تغییر بدی.')
+                    elif parse_error:
+                        out = message('الان نتونستم پیام رو بخونم. لطفاً دوباره بفرست. فهرست با /list در دسترسه.', context=focus)
                     elif cb:
                         out = callback(db, cb.get('data', ''), now)
-                    elif text.startswith('/'):
-                        out = local_command(db, text, now)
+                    elif isinstance(route, str):
+                        if route == 'invalid_position':
+                            out = message('شماره‌ای از همین فهرست بگو.', context=focus)
+                        elif route.startswith('/'):
+                            out = local_command(db, route, now)
+                        else:
+                            out = callback(db, route, now)
                     else:
-                        quick = QUICK.get(norm(text))
-                        if quick:
-                            intent = Intent(action='list', scope=quick) if quick in ('undated', 'week') else Intent(action=quick)
+                        if isinstance(route, Intent):
+                            intent = route
                         ref = replied_plan(msg)
+                        if focus.get('kind') == 'plan':
+                            ref = [focus['day'], str(focus['revision'])]
                         p = current_plan(db, now.date())
                         if ref and intent.action in ('skip', 'later', 'done') and (
                                 not p or ref != [p['day'], str(p['revision'])]):
                             out = message('این پاسخ مربوط به انتخاب قبلیه.')
+                        elif (focus.get('kind') == 'morning' and focus['day'] != str(now.date())
+                              and intent.action in ('select', 'accept_slot')):
+                            out = message('این پیشنهاد برای امروز نیست. بگو امروز چه کاری مدنظرت هست.')
                         else:
-                            out = interpret(db, text, intent, ctx, now)
+                            out = interpret(db, text, intent, ctx, now, focus.get('ids', []))
                 except (ValueError, OverflowError) as exc:
                     db.execute('ROLLBACK TO input')
                     LOG.info('Input rejected (%s)', type(exc).__name__)
@@ -124,7 +143,8 @@ class Service:
             if not payload:
                 return True
             try:
-                self.tg.send(payload)
+                focus = payload.pop('_context', {})
+                sent = self.tg.send(payload)
             except DeliveryError as exc:
                 delay = max(exc.delay, min(300, 2 ** min(8, job['attempts'] + 1)))
                 with db:
@@ -136,6 +156,8 @@ class Service:
                 LOG.warning('Delivery %s (%s)', job['key'], exc.state)
             else:
                 with db:
+                    db.execute('INSERT OR REPLACE INTO chat_messages VALUES (?,?)',
+                               (sent['message_id'], json.dumps(focus)))
                     self.finish(db, job, stamp, 'sent')
             return True
 

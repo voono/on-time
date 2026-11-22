@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS jobs (
  retry_at INTEGER, sent_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(state,at);
+CREATE TABLE IF NOT EXISTS chat_messages (message_id INTEGER PRIMARY KEY, context TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS views (id INTEGER PRIMARY KEY, scope TEXT NOT NULL, target TEXT NOT NULL);
 """
 
@@ -64,8 +65,10 @@ def put(db, key, value):
     db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, value))
 
 
-def message(text, rows=()):
+def message(text, rows=(), *, context=None):
     result = {'text': text}
+    if context:
+        result['_context'] = context
     if rows:
         result['reply_markup'] = {'inline_keyboard': [
             [{'text': label, 'callback_data': data} for label, data in row] for row in rows]}

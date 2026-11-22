@@ -114,13 +114,19 @@ def morning(db, now):
         i = item['id']
         a, b = slot if index == 0 and slot else (None, None)
         db.execute('INSERT INTO suggestions VALUES (?,?,?,?)', (str(day), i, a, b))
-        lines.append('• ' + item['title'])
-        rows.append([(f'انتخاب {fa(index + 1)}', f'pick:{day}:{i}')])
+        lines.append(f'{fa(index+1)}. ' + item['title'])
         if a is not None:
             span = ' تا '.join(fa(datetime.fromtimestamp(t, now.tzinfo).strftime('%H:%M')) for t in (a, b))
             lines.append(('فرصتی برای شروع: ' if not item['minutes'] else 'زمان پیشنهادی: ') + span)
-            rows[-1].append([f'قبول {span}', f'slot:{day}:{i}'])
-    return message('\n'.join(lines), rows)
+    if chosen:
+        first = chosen[0]['id']
+        if slot:
+            rows = [[('قبول همین ساعت برای گزینهٔ اول', f'slot:{day}:{first}')]]
+        else:
+            rows = [[('برای امروز انتخابش کن', f'pick:{day}:{first}')]]
+        lines.append('برای انتخاب، شماره یا اسم کار رو بگو.')
+    return message('\n'.join(lines), rows, context={'kind': 'morning', 'day': str(day),
+                   'ids': [item['id'] for item in chosen]} if chosen else None)
 
 
 def current_plan(db, day):
@@ -155,7 +161,8 @@ def choose(db, now, item, accept=False):
         enqueue(db, key, 'follow', at, day=day, item=i)
     p = current_plan(db, day)
     suffix = '؛ با همون زمان پیشنهادی' if accept else ''
-    return message(f'برای امروز انتخاب شد: {item["title"]}{suffix}.', plan_buttons(p))
+    return message(f'برای امروز انتخاب شد: {item["title"]}{suffix}.',
+                   context={'kind': 'plan', 'ids': [i], 'day': day, 'revision': p['revision']})
 
 
 def close_plan(db, p, status):
@@ -224,7 +231,7 @@ def scheduled_message(db, job, now):
                 if datetime.fromtimestamp(row['remind_at'], zone).date() < today:
                     arm(db, row['id'], instant(today, row['reminder_clock'], zone))
                     return None
-            return message('⏰ ' + row['title'] + ('\n' + row['details'] if row['details'] else ''))
+            return message('⏰ ' + row['title'] + ('\n' + row['details'] if row['details'] else ''), context={'ids': [row['id']]})
         return None
     if job['day'] != str(now.date()):
         return None
@@ -236,5 +243,6 @@ def scheduled_message(db, job, now):
         plan = current_plan(db, now.date())
         row = item_by_id(db, job['item_id'])
         if plan and plan['item_id'] == job['item_id'] and row and row['status'] == 'open':
-            return message('فرصت شد «' + row['title'] + '» رو انجام بدی؟', plan_buttons(plan))
+            return message('فرصت شد «' + row['title'] + '» رو انجام بدی؟', plan_buttons(plan),
+                           context={'kind': 'plan', 'ids': [row['id']], 'day': plan['day'], 'revision': plan['revision']})
     return None
