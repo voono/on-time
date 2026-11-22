@@ -1,0 +1,25 @@
+[Unit]
+Description=BeMoghe Persian Telegram organizer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/var/lib/ontime
+Environment=PYTHONPATH=/opt/ontime
+EnvironmentFile=/etc/ontime.env
+StateDirectory=ontime
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/ontime/.venv/bin/python -m ontime
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
