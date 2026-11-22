@@ -53,5 +53,8 @@ class Telegram:
     def send(self, payload):
         return self.call('sendMessage', {'chat_id': self.owner, **payload})
 
-    def ack(self, callback_id):
-        self.call('answerCallbackQuery', {'callback_query_id': callback_id})
+    def ack(self, callback_id, text=''):
+        self.call('answerCallbackQuery', {'callback_query_id': callback_id, 'text': text})
+
+    def mark_checkin(self, message_id, markup):
+        self.call('editMessageReplyMarkup', {'chat_id': self.owner, 'message_id': message_id, 'reply_markup': markup})

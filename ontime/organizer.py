@@ -3,11 +3,12 @@ import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from . import deadlines, feedback, nightly
 from .dates import WEEKDAYS, clock, fa, instant, label, norm, occurrence, resolve, solar_parts
 from .intent import Intent
 from .planner import (arm, choose, clear_reminder, close_plan, current_plan, next_annual, next_daily,
                       set_windows)
-from .store import cancel, enqueue, item_by_id, message, pending, pref, put, set_pending
+from .store import cancel, enqueue, item_by_id, message, pending, pref, put, set_pending, tasks_keyboard
 
 KINDS = {'task': 'کار', 'note': 'یادداشت', 'event': 'مناسبت', 'reminder': 'یادآوری'}
 HELP = """هرچی توی ذهنت هست بنویس. مثلاً «یه وقت به دندون‌پزشک زنگ بزنم» یا «فردا ساعت ۱۰ یادم بنداز قبض رو بدم».
@@ -45,7 +46,7 @@ def candidate_titles(db, text, now, context):
             candidate = dict(row)
             if candidate['remind_at'] is not None:
                 candidate['remind_at'] = datetime.fromtimestamp(row['remind_at'], now.tzinfo).isoformat()
-            candidate.update(selected_today=selected, position=position)
+            candidate.update(selected_today=selected, position=position, checkin=bool(position and context.get('checkin')))
             candidates.append((bool(position), score, row['id'], candidate))
     return [data for _, _, _, data in sorted(candidates, reverse=True)[:12]]
 
@@ -61,12 +62,12 @@ def list_page(db, scope, target, page, now, view=None):
         keep = {'today': d == today, 'week': bool(d and week <= d < week + timedelta(days=7)),
                 'undated': item['kind'] == 'task' and d is None, 'notes': item['kind'] == 'note',
                 'events': item['kind'] == 'event', 'reminders': item['remind_at'] is not None,
-                'all': True}[scope]
+                'tasks': item['kind'] == 'task', 'all': True}[scope]
         # Explicit reminders also belong in date-based agenda views.
         rday = datetime.fromtimestamp(item['remind_at'], now.tzinfo).date() if item['remind_at'] else None
         if keep or (scope == 'today' and rday == today) or (scope == 'week' and rday and week <= rday < week + timedelta(days=7)):
             found.append((item, d))
-    header = []
+    header = ['کارهای بازت'] if scope == 'tasks' and found else []
     selected_id = None
     if scope == 'today' and not target:
         plan = current_plan(db, today)
@@ -77,7 +78,7 @@ def list_page(db, scope, target, page, now, view=None):
     if not found and header:
         return message(header[0], context={'ids': [selected_id]})
     if not found:
-        return message('چیزی با این مشخصات پیدا نکردم.')
+        return message('فعلاً کار بازی نداری.' if scope == 'tasks' and not target else 'چیزی با این مشخصات پیدا نکردم.')
     found.sort(key=lambda x: (x[1] is None, str(x[1]), x[0]['due_clock'] or '', -x[0]['id']))
     size = 6
     page = min(max(0, page), (len(found) - 1) // size)
@@ -124,6 +125,10 @@ def detail(db, item, now):
     d = occurrence(item, now.date())
     if d:
         lines.append('موعد: ' + label(d) + (' ' + fa(item['due_clock']) if item['due_clock'] else ''))
+    job = db.execute("SELECT at FROM jobs WHERE kind='deadline' AND item_id=? AND state='pending'", (i,)).fetchone()
+    if job:
+        at = datetime.fromtimestamp(job['at'], now.tzinfo)
+        lines.append('یادآوری بعدیِ کار: ' + label(at.date()) + ' ساعت ' + fa(at.strftime('%H:%M')))
     if item['annual']:
         lines.append('هر سال در تقویم ' + ('شمسی' if item['calendar'] == 'jalali' else 'میلادی'))
     if item['remind_at']:
@@ -134,17 +139,33 @@ def detail(db, item, now):
 def local_command(db, text, now):
     cmd, _, arg = norm(text).partition(' ')
     if cmd in ('/start', '/help'):
-        return message(HELP)
-    scopes = {'/tasks': 'undated', '/notes': 'notes', '/list': 'all', '/week': 'week', '/today': 'today'}
+        return {**message(HELP), 'reply_markup': tasks_keyboard()}
+    scopes = {'/mytasks': 'tasks', '/tasks': 'undated', '/notes': 'notes', '/list': 'all', '/week': 'week', '/today': 'today'}
     if cmd in scopes:
         return list_page(db, scopes[cmd], '', 0, now)
+    if cmd == '/history':
+        return feedback.history(db, now, arg)
+    if cmd == '/report':
+        return nightly.report(db, now)
     if cmd == '/cancel':
         set_pending(db, None)
         return message('سؤال بسته شد.')
     if cmd == '/settings':
         return message(f"صبح‌بخیر: {fa(pref(db,'morning'))} ({'روشن' if pref(db,'enabled')=='1' else 'خاموش'})"
+                       f"\nجمع‌بندی شب: {fa(pref(db,'night'))} ({'روشن' if pref(db,'night_enabled')=='1' else 'خاموش'})"
                        f"\nپیگیری: {fa(pref(db,'follow'))}\nمناسبت‌های نزدیک: {fa(pref(db,'near'))} روز"
                        f"\nمنطقه: {pref(db,'zone')}\nبرای تغییرش بگو «صبح‌بخیر رو ساعت ۹ بفرست».")
+    if cmd == '/night':
+        if arg in ('off', 'خاموش'):
+            put(db, 'night_enabled', '0')
+        else:
+            if arg not in ('on', 'روشن'):
+                put(db, 'night', clock(arg))
+            put(db, 'night_enabled', '1')
+        db.execute("DELETE FROM jobs WHERE kind='night' AND state IN ('pending','cancelled')")
+        if pref(db, 'night_enabled') == '0':
+            return message('جمع‌بندی شبانه خاموش شد.')
+        return message('جمع‌بندی شب رو ساعت ' + fa(pref(db, 'night')) + ' می‌فرستم.')
     if cmd == '/near':
         if not arg.isdecimal() or not 0 <= int(arg) <= 365:
             raise ValueError('تعداد روز را بین ۰ و ۳۶۵ بنویس.')
@@ -167,7 +188,7 @@ def local_command(db, text, now):
                 raise ValueError('نام منطقه را مثل Asia/Tehran بنویس.') from None
             put(db, 'zone', name)
             now = now.astimezone(zone)
-            db.execute("DELETE FROM jobs WHERE kind='morning' AND state IN ('pending','cancelled')")
+            db.execute("DELETE FROM jobs WHERE kind IN ('morning','night') AND state IN ('pending','cancelled')")
         else:
             put(db, 'follow', clock(arg))
         p = current_plan(db, now.date())
@@ -216,7 +237,10 @@ def ask(db, text, original, intent, now, **extra):
     put(db, 'question_seq', str(seq))
     set_pending(db, {'original': original, 'at': now.isoformat(), 'draft': draft, 'question_token': seq,
                      'question': text, **extra})
-    return message(text, context={'kind': 'question', 'question_token': seq})
+    context = {'kind': 'question', 'question_token': seq}
+    if extra.get('edit_id'):
+        context['ids'] = [extra['edit_id']]
+    return message(text, context=context)
 
 
 def save_item(db, intent, original, now, item=None):
@@ -294,6 +318,15 @@ def save_item(db, intent, original, now, item=None):
         text += ' (بی‌موعد)'
     if stamp:
         text += '\nیادآوری: ' + reminder_label(saved, now.tzinfo)
+    if due_day and kind == 'task':
+        plan = db.execute('SELECT * FROM deadline_plans WHERE item_id=?', (i,)).fetchone()
+        minutes = intent.effort_minutes or (plan['effort_minutes'] if plan else saved['minutes'])
+        if minutes:
+            hm = plan['clock'] if plan else pref(db, 'morning')
+            text += '\n' + deadlines.configure(db, saved, minutes, now, hm)
+        elif deadlines.cutoff(saved, now.tzinfo) > now.timestamp():
+            return ask(db, text + '\nفکر می‌کنی چقدر زمان می‌بره؟ مثلاً «۲ روز».',
+                       original, Intent(action='estimate', target=str(i)), now, field='effort', edit_id=i)
     return message(text, context={'ids': [i]})
 
 
@@ -309,6 +342,9 @@ def apply_action(db, intent, original, now, item=None, visible=()):
         response = local_command(db, '/' + intent.setting + ' ' + intent.value, now)
         set_pending(db, None)
         return response
+    if a == 'history':
+        period = {'yesterday': 'دیروز', 'today': 'امروز'}.get(intent.value, '')
+        return feedback.history(db, now, (period + ' ' + intent.target).strip())
     if a == 'list':
         set_pending(db, None)
         return list_page(db, intent.scope, intent.target, 0, now)
@@ -358,20 +394,31 @@ def apply_action(db, intent, original, now, item=None, visible=()):
         return detail(db, item, now)
     if a == 'reschedule':
         return save_item(db, intent, original, now, item)
+    if a == 'estimate':
+        if item['kind'] != 'task' or not item['due_day']:
+            return message('برای یادآوری شروع کار، اول موعدش رو مشخص کن.')
+        minutes = intent.effort_minutes or intent.minutes
+        if not minutes:
+            return ask(db, 'چقدر زمان می‌بره؟ مثلاً «۲ روز».', original, intent, now, field='effort', edit_id=i)
+        return message(f'برای «{item["title"]}» تنظیم شد.\n' +
+                       deadlines.configure(db, item, minutes, now, pref(db, 'morning')), context={'ids': [i]})
     if a == 'cancel_reminder':
+        deadlines.stop(db, i)
         clear_reminder(db, item)
         return message('یادآوری «' + item['title'] + '» لغو شد.')
     if a in ('done', 'cancel_item'):
         if a == 'done' and item['kind'] != 'task':
             return message('این مورد کار نیست.')
         status = 'done' if a == 'done' else 'cancelled'
-        db.execute('UPDATE items SET status=? WHERE id=?', (status, i))
-        clear_reminder(db, item)
-        if p and p['item_id'] == i:
-            close_plan(db, p, status)
+        close_item(db, item, status, now)
         return message('«' + item['title'] + ('» انجام شد.' if a == 'done' else '» لغو شد.'))
     if not p or p['item_id'] != i:
         return message('این کار برای امروز انتخاب نشده.')
+    if a == 'later':
+        checkin = db.execute('SELECT id FROM checkins WHERE revision=? AND job_key=?',
+                             (p['revision'], 'follow:' + p['day'])).fetchone()
+        if checkin:
+            feedback.record(db, checkin['id'], 'later', now)
     close_plan(db, p, a)
     if a == 'later':
         edit = Intent(action='reschedule', target=str(i), wants_reminder=True, remind=intent.remind)
@@ -382,10 +429,26 @@ def apply_action(db, intent, original, now, item=None, visible=()):
     return message('باشه، امروز ردش کردیم. «' + item['title'] + '» توی کارهای بی‌موعد موند.')
 
 
+def close_item(db, item, status, now):
+    db.execute('UPDATE items SET status=? WHERE id=?', (status, item['id']))
+    if status == 'done' and item['kind'] == 'task':
+        nightly.record_completion(db, item, now)
+    deadlines.stop(db, item['id'])
+    clear_reminder(db, item)
+    p = current_plan(db, now.date())
+    if p and p['item_id'] == item['id']:
+        close_plan(db, p, status)
+
+
 def callback(db, data, now):
     parts = data.split(':')
     action = parts[0]
     expired = message('این دکمه برای انتخاب فعلی نیست. /today')
+    if action == 'check' and len(parts) == 3 and re.fullmatch(r'[0-9]{1,18}', parts[1]) and parts[2] in ('done', 'missed'):
+        out, item = feedback.record(db, int(parts[1]), parts[2], now)
+        if item:
+            close_item(db, item, 'done', now)
+        return out
     if action in ('done', 'skip', 'later'):
         p = current_plan(db, now.date())
         if not p or parts[1:] != [p['day'], str(p['revision'])]:
@@ -433,6 +496,15 @@ def callback(db, data, now):
 def interpret(db, text, intent, ctx, now, visible=()):
     if not ctx or not intent.continuation:
         return apply_action(db, intent, text, now, visible=visible)
+    if ctx.get('field') == 'effort':
+        item = item_by_id(db, ctx['edit_id'])
+        if not item or item['status'] != 'open':
+            set_pending(db, None)
+            return message('این کار دیگه باز نیست.')
+        if intent.action in ('cancel_reminder', 'done', 'cancel_item'):
+            return apply_action(db, intent, text, now, item)
+        estimate = Intent(action='estimate', effort_minutes=intent.effort_minutes or intent.minutes)
+        return apply_action(db, estimate, text, now, item)
     old = Intent.model_validate(ctx['draft'])
     if 'token' in ctx:
         selected = [i for i in ctx['ids'] if (r := item_by_id(db, i)) and

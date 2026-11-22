@@ -30,6 +30,7 @@ class RuntimeTest(unittest.TestCase):
             db = connect(path)
             with db:
                 put(db, 'enabled', '0')
+                put(db, 'night_enabled', '0')
                 i = db.execute("""INSERT INTO items(kind,title,details,created_at,calendar,annual,important,short)
                     VALUES ('reminder','قرار قبلی','',0,'jalali',0,0,0)""").lastrowid
                 arm(db, i, int(time.time()))

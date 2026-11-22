@@ -4,11 +4,12 @@ import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from . import deadlines, feedback, nightly
 from .conversation import conversation_context, shortcut
 from .intent import Intent
 from .organizer import callback, candidate_titles, interpret, local_command
 from .planner import arm, current_plan, morning_due, next_annual, next_daily, reminder_key, scheduled_message
-from .store import connect, enqueue, item_by_id, message, pending, pref, put
+from .store import connect, enqueue, item_by_id, message, pending, pref, put, tasks_keyboard
 from .transport import DeliveryError
 
 LOG = logging.getLogger(__name__)
@@ -51,6 +52,8 @@ class Service:
         parsed = incoming(update, self.owner)
         intent = None
         parse_error = False
+        check_button = False
+        mark_checkin = None
         if parsed:
             cb, msg = parsed
             text = msg.get('text', '').strip()
@@ -64,12 +67,13 @@ class Service:
                 else:
                     ctx = None
             route = None if cb else shortcut(text, focus, ctx)
-            if cb:
+            check_button = bool(cb and cb.get('data', '').startswith('check:'))
+            if cb and not check_button:
                 try:
                     self.tg.ack(cb['id'])
                 except DeliveryError:
                     pass
-            elif route is None and not stale_question:
+            elif not cb and route is None and not stale_question:
                 try:
                     received = self.local(db)
                     intent = self.router.parse(text, received, ctx, candidate_titles(db, text, received, focus))
@@ -89,7 +93,9 @@ class Service:
                     elif cb:
                         out = callback(db, cb.get('data', ''), now)
                     elif isinstance(route, str):
-                        if route == 'invalid_position':
+                        if route == 'invalid_effort':
+                            out = message('مدت رو با یک عدد مثبت بنویس، مثلاً «۲ روز».', context=focus)
+                        elif route == 'invalid_position':
                             out = message('شماره‌ای از همین فهرست بگو.', context=focus)
                         elif route.startswith('/'):
                             out = local_command(db, route, now)
@@ -102,7 +108,12 @@ class Service:
                         if focus.get('kind') == 'plan':
                             ref = [focus['day'], str(focus['revision'])]
                         p = current_plan(db, now.date())
-                        if ref and intent.action in ('skip', 'later', 'done') and (
+                        if intent.action == 'checkin':
+                            if focus.get('checkin') and intent.value in ('done', 'missed'):
+                                out = callback(db, f"check:{focus['checkin']}:{intent.value}", now)
+                            else:
+                                out = message('روی یادآوری مدنظرت جواب بده تا برای همون نوبت ثبت کنم.')
+                        elif ref and intent.action in ('skip', 'later', 'done') and (
                                 not p or ref != [p['day'], str(p['revision'])]):
                             out = message('این پاسخ مربوط به انتخاب قبلیه.')
                         elif (focus.get('kind') == 'morning' and focus['day'] != str(now.date())
@@ -116,10 +127,26 @@ class Service:
                     hint = str(exc)
                     out = message(hint if hint and len(hint) < 200 and any('\u0600' <= c <= '\u06ff' for c in hint)
                                   else 'این تاریخ یا مقدار معتبر نیست. دوباره بنویس.')
-                enqueue(db, f"reply:{pref(db, 'epoch', '0')}:{uid}", 'reply', int(now.timestamp()), payload=out)
+                mark_checkin = out.pop('_mark_checkin', None)
+                if not check_button:
+                    enqueue(db, f"reply:{pref(db, 'epoch', '0')}:{uid}", 'reply', int(now.timestamp()), payload=out)
                 db.execute('RELEASE input')
             put(db, 'offset', str(uid + 1))
             put(db, 'last_update', str(int(self.utc_now().timestamp())))
+
+        if check_button:
+            try:
+                self.tg.ack(cb['id'], out['text'][:200])
+            except DeliveryError:
+                pass
+        if mark_checkin is not None:
+            row = db.execute('SELECT * FROM checkins WHERE id=?', (mark_checkin,)).fetchone()
+            message_id = row['message_id'] or (msg.get('message_id') if check_button else None)
+            if message_id:
+                try:
+                    self.tg.mark_checkin(message_id, feedback.keyboard(mark_checkin, row['day'], row['revision'], row['outcome']))
+                except DeliveryError:
+                    pass
 
     def tick(self, db):
         with self.lock:
@@ -133,17 +160,26 @@ class Service:
                         self.finish(db, old, stamp, 'uncertain')
                     self.recovered = True
                 morning_due(db, now)
+                nightly.queue_report(db, now)
                 job = db.execute("""SELECT * FROM jobs WHERE state='pending' AND at<=?
-                    AND (retry_at IS NULL OR retry_at<=?) ORDER BY at,rowid LIMIT 1""", (stamp,stamp)).fetchone()
+                    AND (retry_at IS NULL OR retry_at<=?)
+                    ORDER BY at, CASE kind WHEN 'morning' THEN 0 WHEN 'night' THEN 2 ELSE 1 END,
+                    rowid LIMIT 1""", (stamp,stamp)).fetchone()
                 if not job:
                     return False
                 payload = scheduled_message(db, job, now)
+                if payload and job['kind'] in ('deadline', 'reminder', 'follow'):
+                    feedback.prepare(db, job, payload, now)
+                elif payload and job['kind'] == 'morning':
+                    feedback.morning_hint(db, payload, now)
                 db.execute("UPDATE jobs SET state=? WHERE key=?",
                            ('sending' if payload else 'cancelled', job['key']))
             if not payload:
                 return True
             try:
                 focus = payload.pop('_context', {})
+                if job['kind'] == 'reply' and 'reply_markup' not in payload and not pref(db, 'tasks_keyboard'):
+                    payload['reply_markup'] = tasks_keyboard()
                 sent = self.tg.send(payload)
             except DeliveryError as exc:
                 delay = max(exc.delay, min(300, 2 ** min(8, job['attempts'] + 1)))
@@ -156,6 +192,12 @@ class Service:
                 LOG.warning('Delivery %s (%s)', job['key'], exc.state)
             else:
                 with db:
+                    if 'checkin' in focus and job['kind'] in ('deadline', 'reminder', 'follow'):
+                        db.execute('UPDATE checkins SET message_id=? WHERE id=?', (sent['message_id'], focus['checkin']))
+                    if 'hint' in focus:
+                        db.execute('INSERT OR REPLACE INTO checkin_hints VALUES (?,?,?)', focus.pop('hint'))
+                    if 'keyboard' in payload.get('reply_markup', {}):
+                        put(db, 'tasks_keyboard', '1')
                     db.execute('INSERT OR REPLACE INTO chat_messages VALUES (?,?)',
                                (sent['message_id'], json.dumps(focus)))
                     self.finish(db, job, stamp, 'sent')
@@ -177,7 +219,9 @@ class Service:
     def finish(self, db, job, stamp, state):
         db.execute('UPDATE jobs SET state=?,sent_at=? WHERE key=?',
                    (state, int(self.utc_now().timestamp()) if state == 'sent' else None, job['key']))
-        if job['kind'] == 'reminder':
+        if job['kind'] == 'deadline':
+            deadlines.schedule(db, job['item_id'], self.local(db), after_day=job['day'])
+        elif job['kind'] == 'reminder':
             self.advance_reminder(db, job, stamp)
 
     def run(self, stop):

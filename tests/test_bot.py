@@ -30,7 +30,7 @@ class FakeRouter:
 
 class FakeTelegram:
     def __init__(self):
-        self.sent, self.failures = [], []
+        self.sent, self.failures, self.acks = [], [], []
 
     def send(self, payload):
         if self.failures:
@@ -38,8 +38,12 @@ class FakeTelegram:
         self.sent.append(payload)
         return {'message_id': len(self.sent)}
 
-    def ack(self, _):
-        pass
+    def ack(self, _, text=''):
+        self.acks.append(text)
+
+    def mark_checkin(self, message_id, markup):
+        self.marked_message_id = message_id
+        self.selected = markup
 
 
 class BotTest(unittest.TestCase):
@@ -480,3 +484,247 @@ class BotTest(unittest.TestCase):
         self.assertIn('۰۹:۰۰', self.send('صبح‌بخیر رو ساعت ۹ بفرست',
                       dict(action='setting', setting='morning', value='09:00')))
         self.assertIn('۰۹:۰۰', self.send('تنظیمات'))
+
+    def test_task_button_lists_dated_and_undated_without_router(self):
+        self.task('تحویل گزارش', due=when('+4'))
+        self.task('تماس')
+        self.send('یادداشت سفر', dict(action='create', kind='note', title='یادداشت سفر'))
+        self.send('/start')
+        self.assertEqual(self.tg.sent[-1]['reply_markup']['keyboard'], [[{'text':'کارهای من'}]])
+        calls = len(self.router.calls)
+        listing = self.send('کارهای من')
+        self.assertIn('تحویل گزارش', listing)
+        self.assertIn('تماس', listing)
+        self.assertNotIn('یادداشت سفر', listing)
+        self.assertIn('تحویل گزارش', self.send('اولی'))
+        self.assertEqual(len(self.router.calls), calls)
+
+    def test_two_days_before_deadline_repeats_until_done(self):
+        text = 'تا قبل چهارشنبه باید گزارش رو تحویل بدم'
+        prompt = self.send(text, dict(action='create', kind='task', title='گزارش', due=when('+4','00:00')))
+        self.assertIn('چقدر زمان می‌بره', prompt)
+        self.assertEqual(item_by_id(self.db,1)['due_day'], str(self.now.date() + timedelta(days=4)))
+        self.restart()
+        self.assertIn('روزی یک‌بار', self.send('۲ روز'))
+        self.assertEqual(len(self.router.calls),1)
+        self.now += timedelta(days=2, hours=1, minutes=29)
+        self.drain()
+        alerts = lambda: [m for m in self.tg.sent if m['text'].startswith('یادآوری کار «')]
+        self.assertFalse(alerts())
+        self.now += timedelta(minutes=1)
+        self.drain()
+        self.assertEqual(len(alerts()),1)
+        self.restart()
+        self.drain()
+        self.assertEqual(len(alerts()),1)
+        self.now += timedelta(days=1)
+        self.drain()
+        self.assertEqual(len(alerts()),2)
+        self.send('انجام شد')
+        self.assertEqual(item_by_id(self.db,1)['status'],'done')
+        self.now += timedelta(days=2)
+        self.drain()
+        self.assertEqual(len(alerts()),2)
+
+    def test_deadline_change_retry_and_expiry(self):
+        self.send('/morning off')
+        self.task('فرم', due=when('+3','14:00'), effort_minutes=2880)
+        self.send('تا پنجشنبه وقت دارم', dict(action='reschedule',target='فرم',due=when('+5','14:00')))
+        self.now += timedelta(days=2, hours=2)
+        self.drain()
+        self.assertFalse(any(m['text'].startswith('یادآوری کار «') for m in self.tg.sent))
+        self.now += timedelta(days=2)
+        self.restart()
+        self.tg.failures.append(DeliveryError('pending',5))
+        self.drain()
+        self.now += timedelta(seconds=5)
+        self.drain()
+        self.assertEqual(sum(m['text'].startswith('یادآوری کار «') for m in self.tg.sent),1)
+        self.now += timedelta(days=1, hours=6)
+        self.drain()
+        self.assertEqual(sum(m['text'].startswith('یادآوری کار «') for m in self.tg.sent),1)
+        self.assertFalse(self.db.execute("SELECT 1 FROM jobs WHERE kind='deadline' AND state='pending'").fetchone())
+
+    def test_skip_effort_and_cancel_without_altering_deadline(self):
+        i = self.task('کار اول',due=when('+5'))
+        self.send('فعلا نه')
+        self.assertIsNone(pending(self.db))
+        self.assertEqual(item_by_id(self.db,i)['status'],'open')
+        i = self.task('کار دوم',due=when('+5'),remind=when('+1','14:00'))
+        self.send('دو روز')
+        self.assertIsNotNone(item_by_id(self.db,i)['remind_at'])
+        self.send('یادآوریش رو لغو کن', dict(action='cancel_reminder',target=str(i)))
+        self.assertIsNone(item_by_id(self.db,i)['remind_at'])
+        self.assertFalse(self.db.execute("SELECT 1 FROM jobs WHERE kind='deadline' AND state='pending'").fetchone())
+        self.assertIsNotNone(item_by_id(self.db,i)['due_day'])
+
+    def test_finish_early_stops_preparation_and_preserves_other_tasks(self):
+        self.task('گزارش', due=when('+4'), effort_minutes=2880)
+        self.task('تمرین', due=when('+4'), effort_minutes=2880)
+        self.now += timedelta(days=2, hours=2)
+        self.drain()
+        self.send('گزارش رو انجام دادم', dict(action='done', target='گزارش'))
+        self.restart()
+        self.now += timedelta(days=1)
+        self.drain()
+        self.now += timedelta(days=1)
+        self.drain()
+        alerts = [m['text'] for m in self.tg.sent if m['text'].startswith('یادآوری کار «')]
+        self.assertEqual(sum('«گزارش»' in text for text in alerts), 1)
+        self.assertEqual(sum('«تمرین»' in text for text in alerts), 3)
+        self.assertFalse(self.db.execute("SELECT 1 FROM jobs WHERE kind='deadline' AND state='pending'").fetchone())
+
+    def test_daily_checkins_are_per_occurrence_and_offline(self):
+        self.send('قرص هر روز', dict(action='create', kind='reminder', daily=True,
+                  title='قرص', remind=when('0', '10:00')))
+        self.at(10)
+        first = self.tg.sent[-1]['reply_markup']['inline_keyboard'][0]
+        self.assertEqual([b['text'] for b in first], ['انجام دادم', 'انجام ندادم'])
+        before = len(self.tg.sent)
+        self.send(first[1]['callback_data'], button=True)
+        self.send(first[1]['callback_data'], button=True)
+        self.assertEqual(len(self.tg.sent), before)
+        self.assertIn('قبلاً', self.tg.acks[-1])
+        self.restart()
+        self.now += timedelta(days=1)
+        self.drain()
+        alarm = self.tg.sent[-1]
+        self.assertIn('برای نوبت دیروز', alarm['text'])
+        second = alarm['reply_markup']['inline_keyboard'][0]
+        self.assertNotEqual(first[0]['callback_data'],second[0]['callback_data'])
+        self.send(second[0]['callback_data'],button=True)
+        self.send(first[0]['callback_data'],button=True)
+        self.assertEqual(item_by_id(self.db,1)['status'],'open')
+        self.assertGreater(item_by_id(self.db,1)['remind_at'],self.now.timestamp())
+        self.assertEqual(self.send('سابقه یادآوری‌ها').count('انجام دادم'),2)
+        self.assertEqual(len(self.router.calls),1)
+
+    def test_unanswered_is_unknown_and_hints_have_cooldown(self):
+        self.send('تمرین', dict(action='create',kind='reminder',title='تمرین',daily=True,remind=when('0','11:00')))
+        self.at(11)
+        self.now += timedelta(days=1)
+        self.drain()
+        self.assertEqual(self.tg.sent[-1]['text'],'⏰ تمرین')
+        self.send('انجام ندادم')
+        self.assertIn('بی‌پاسخ',self.send('/history'))
+        self.now += timedelta(days=1)
+        self.drain()
+        self.assertIn('دیروز',self.tg.sent[-1]['text'])
+        self.send('انجام ندادم')
+        self.now += timedelta(days=1)
+        self.drain()
+        self.assertEqual(self.tg.sent[-1]['text'],'⏰ تمرین')
+
+    def test_task_misses_give_one_morning_hint_and_done_stops_deadline(self):
+        self.task('گزارش',due=when('+4'),effort_minutes=5760)
+        self.at(8,30)
+        for _ in range(2):
+            btn = self.tg.sent[-1]['reply_markup']['inline_keyboard'][0][1]
+            self.send(btn['callback_data'],button=True)
+            self.now += timedelta(days=1)
+            self.drain()
+        hints = [m['text'] for m in self.tg.sent if m['text'].startswith('صبح بخیر') and 'قدم اول' in m['text']]
+        self.assertEqual(len(hints),1)
+        self.assertIn('گزارش', hints[0])
+        self.assertIn('۲ روز', hints[0])
+        btn = self.tg.sent[-1]['reply_markup']['inline_keyboard'][0][0]
+        self.send(btn['callback_data'],button=True)
+        self.assertEqual(item_by_id(self.db,1)['status'],'done')
+        self.assertFalse(self.db.execute("SELECT 1 FROM jobs WHERE kind='deadline' AND state='pending'").fetchone())
+
+    def test_checkin_from_replaced_plan_cannot_finish_new_task(self):
+        a,b = self.task('نامه'), self.task('خرید')
+        self.pick(a)
+        self.at(19)
+        button = self.follows()[0]['reply_markup']['inline_keyboard'][0][0]
+        self.pick(b)
+        self.send(button['callback_data'],button=True)
+        self.assertIn('قبلی',self.tg.acks[-1])
+        self.assertEqual(item_by_id(self.db,a)['status'],'open')
+        self.assertEqual(item_by_id(self.db,b)['status'],'open')
+        self.assertIsNone(self.db.execute('SELECT outcome FROM checkins').fetchone()[0])
+
+    def test_local_yesterday_query_and_correcting_the_original_message(self):
+        self.send('قرص', dict(action='create', kind='reminder', title='خوردن قرص',
+                              daily=True, remind=when('0','09:00')))
+        self.at(9)
+        original = len(self.tg.sent)
+        self.send('نخوردم', reply_to=original)
+        self.now += timedelta(days=1)
+        self.drain()
+        self.assertIn('انجام ندادم', self.send('دیروز قرصم رو ثبت کردم؟'))
+        self.send('خوردم', reply_to=original)
+        self.assertEqual(self.tg.marked_message_id, original)
+        self.assertIn('✓ انجام دادم', str(self.tg.selected))
+        self.assertIn('انجام دادم', self.send('دیروز قرصم رو خوردم؟'))
+        self.assertIn('بی‌پاسخ', self.send('امروز قرصم رو ثبت کردم؟'))
+        self.assertNotIn('خوردن قرص', self.send('سابقه باشگاه'))
+        self.assertEqual(len(self.router.calls), 1)
+
+    def test_nightly_report_counts_recorded_work_and_answers_without_model(self):
+        self.send('/morning off')
+        early = self.task('ارسال فرم', due=when('0', '12:00'))
+        self.send(f'finish:{early}', button=True)
+        self.task('تحویل گزارش', due=when('0', '12:00'))
+        self.task('تماس')
+        self.send('تمرین', dict(action='create', kind='reminder', daily=True, title='تمرین',
+                              remind=when('0', '13:00')))
+        self.send('مطالعه', dict(action='create', kind='reminder', daily=True, title='مطالعه',
+                               remind=when('0', '14:00')))
+        self.at(13)
+        self.send('انجام ندادم')
+        self.at(14)
+        self.send('گزارش انجام شد', dict(action='done', target='گزارش'))
+        self.send('تماس انجام شد', dict(action='done', target='تماس'))
+        self.task('فرستادن پروژه', due=when('+1'))
+        calls = len(self.router.calls)
+        self.at(22, 29)
+        self.assertFalse(any(m['text'].startswith('🌙 جمع‌بندی') for m in self.tg.sent))
+        self.at(22, 30)
+        report = self.tg.sent[-1]['text']
+        self.assertIn('۳ کار انجام شد', report)
+        self.assertIn('۱ از ۲ کار موعددار', report)
+        self.assertIn('هفت روز اخیر', report)
+        self.assertIn('۱ انجام نشد، ۱ بی‌پاسخ', report)
+        self.assertIn('فرستادن پروژه', report)
+        self.assertEqual(report, self.send('گزارش امروز'))
+        self.assertEqual(len(self.router.calls), calls)
+
+    def test_nightly_schedule_uses_local_clock_and_persists_after_restart(self):
+        self.now = datetime(2026, 11, 21, 8, 0, tzinfo=ZoneInfo('America/New_York'))
+        self.send('/morning off')
+        self.send('/tz America/New_York')
+        self.send('/night 21:45')
+        self.now = datetime(2026, 11, 21, 21, 44, tzinfo=ZoneInfo('America/New_York'))
+        self.drain()
+        reports = lambda: [m for m in self.tg.sent if m['text'].startswith('🌙 جمع‌بندی')]
+        self.assertEqual(len(reports()), 0)
+        self.tg.failures.append(DeliveryError('pending', 5))
+        self.now += timedelta(minutes=1)
+        self.drain()
+        self.restart()
+        self.now += timedelta(seconds=5)
+        self.drain()
+        self.restart()
+        self.drain()
+        self.assertEqual(len(reports()), 1)
+        self.assertIn('هنوز انجام کاری ثبت نشده', reports()[0]['text'])
+        self.send('/night off')
+        self.now += timedelta(days=1)
+        self.drain()
+        self.assertEqual(len(reports()), 1)
+        self.send('/night on')
+        self.assertEqual(len(reports()), 2)
+
+    def test_completion_from_deadline_notification_is_recorded_once(self):
+        i = self.task('پروژه', due=when('+1'), effort_minutes=1440)
+        self.at(8, 30)
+        reminder = next(m for m in self.tg.sent if m['text'].startswith('یادآوری کار'))
+        done = reminder['reply_markup']['inline_keyboard'][0][0]['callback_data']
+        self.send(done, button=True)
+        self.send(done, button=True)
+        rows = self.db.execute('SELECT item_id,on_time FROM task_completions').fetchall()
+        self.assertEqual([tuple(row) for row in rows], [(i,1)])
+        self.now += timedelta(days=1)
+        self.drain()
+        self.assertIn('امروز هنوز انجام کاری ثبت نشده', self.send('/report'))

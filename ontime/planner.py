@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from . import deadlines, nightly
 from .dates import clock, fa, instant, label, occurrence
 from .store import cancel, enqueue, item_by_id, message, pref
 
@@ -220,6 +221,8 @@ def morning_due(db, now):
 
 def scheduled_message(db, job, now):
     kind = job['kind']
+    if kind == 'deadline':
+        return deadlines.notification(db, job, now)
     if kind == 'reply':
         return json.loads(job['payload'])
     if kind == 'reminder':
@@ -235,6 +238,8 @@ def scheduled_message(db, job, now):
         return None
     if job['day'] != str(now.date()):
         return None
+    if kind == 'night' and pref(db, 'night_enabled') == '1':
+        return nightly.report(db, now)
     if kind == 'morning' and pref(db, 'enabled') == '1':
         at = instant(now.date(), pref(db, 'morning'), now.tzinfo)
         if at <= now.timestamp() < at + 2 * 3600:

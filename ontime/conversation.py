@@ -6,7 +6,7 @@ from .dates import norm
 from .intent import Intent
 
 ORDINALS = ('اول', 'دوم', 'سوم', 'چهارم', 'پنجم', 'ششم', 'هفتم', 'هشتم', 'نهم', 'دهم', 'یازدهم', 'دوازدهم')
-COMMANDS = {'سلام': '/start', 'راهنما': '/help', 'تنظیمات': '/settings',
+COMMANDS = {'سابقه یادآوری ها': '/history', 'سابقه یادآوری هام': '/history', 'سابقه': '/history', 'کارهای من': '/mytasks', 'لیست کارها': '/mytasks', 'فهرست کارها': '/mytasks', 'سلام': '/start', 'راهنما': '/help', 'تنظیمات': '/settings',
             'وقت های آزادم': '/free', 'کارهای بدون موعدم رو نشون بده': '/tasks',
             'این هفته چه کارهایی دارم': '/week', 'بی خیال': '/cancel', 'بیخیال': '/cancel', 'انصراف': '/cancel'}
 STATUS = {'انجام شد': 'done', 'انجامش دادم': 'done', 'تموم شد': 'done',
@@ -28,10 +28,35 @@ def shortcut(text, context, draft):
     value = norm(text).strip(' ؟?!.')
     if text.startswith('/'):
         return text
+    if value in ('گزارش امروز', 'گزارش شبانه', 'جمع بندی امروز', 'جمع بندی امشب'):
+        return '/report'
     if value in COMMANDS:
         return COMMANDS[value]
+    if value.startswith('سابقه '):
+        return '/history ' + value.removeprefix('سابقه ').removeprefix('یادآوری ')
+    if text.rstrip().endswith(('؟', '?')):
+        query = re.fullmatch(r'(?:آیا )?(دیروز|امروز) (.+?) (?:رو |را )?(?:خوردم|انجام دادم|ثبت کردم)', value)
+        if query:
+            return f'/history {query[1]} {query[2]}'
+    if draft and draft.get('field') == 'effort':
+        if value in ('نمی دونم', 'نمیدونم', 'فعلا نه', 'رد کن'):
+            return '/cancel'
+        match = re.fullmatch(r'(?:حدود\s*)?(\d{1,6}|یک|یه|دو|سه|چهار|پنج|شش|هفت|نیم)\s*(روز|هفته|ساعت|دقیقه)(?:ه| طول میکشه| طول می کشه)?', value)
+        if match:
+            qty, unit = match.groups()
+            words = {'یک': 1, 'یه': 1, 'دو': 2, 'سه': 3, 'چهار': 4, 'پنج': 5, 'شش': 6, 'هفت': 7, 'نیم': 0.5}
+            amount = int(qty) if qty.isdecimal() else words[qty]
+            minutes = int(amount * {'روز': 1440, 'هفته': 10080, 'ساعت': 60, 'دقیقه': 1}[unit])
+            if 1 <= minutes <= 5256000:
+                return Intent(action='estimate', continuation=True, effort_minutes=minutes)
+            return 'invalid_effort'
     ids = context.get('ids', [])
     kind = context.get('kind')
+    if context.get('checkin'):
+        if value in ('انجام دادم', 'انجامش دادم', 'انجام شد', 'خوردم', 'تموم شد'):
+            return f"check:{context['checkin']}:done"
+        if value in ('انجام ندادم', 'انجامش ندادم', 'نخوردم', 'هنوز نه'):
+            return f"check:{context['checkin']}:missed"
     if value in STATUS:
         return Intent(action=STATUS[value], target='@' if ids else '')
     if value in ('همون ساعت خوبه', 'همین ساعت خوبه') and kind == 'morning':
@@ -41,7 +66,7 @@ def shortcut(text, context, draft):
             return f"page:{context['view']}:{context['page']+1}"
         if value in ('قبلی', 'صفحه قبل') and context['page']:
             return f"page:{context['view']}:{context['page']-1}"
-    if not ids or (draft and kind != 'match'):
+    if not ids or (draft and kind not in ('list', 'match')):
         return None
     action = None
     word = value
