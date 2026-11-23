@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from ontime.dates import solar_date, solar_parts
 from ontime.intent import Intent
 from ontime.service import Service
-from ontime.store import connect, item_by_id, pending, setup
+from ontime.store import connect, item_by_id, pending, put, setup
 from ontime.transport import DeliveryError
 
 ZONE = ZoneInfo('Asia/Tehran')
@@ -490,13 +490,38 @@ class BotTest(unittest.TestCase):
         self.task('تماس')
         self.send('یادداشت سفر', dict(action='create', kind='note', title='یادداشت سفر'))
         self.send('/start')
-        self.assertEqual(self.tg.sent[-1]['reply_markup']['keyboard'], [[{'text':'کارهای من'}]])
+        self.assertEqual(self.tg.sent[-1]['reply_markup']['keyboard'],
+                         [[{'text': 'همهٔ کارها'}, {'text': 'کارهای امروز'}]])
         calls = len(self.router.calls)
-        listing = self.send('کارهای من')
+        listing = self.send('همهٔ کارها')
         self.assertIn('تحویل گزارش', listing)
         self.assertIn('تماس', listing)
         self.assertNotIn('یادداشت سفر', listing)
         self.assertIn('تحویل گزارش', self.send('اولی'))
+        self.assertEqual(len(self.router.calls), calls)
+
+    def test_today_button_refreshes_old_keyboard_and_lists_only_todays_open_tasks(self):
+        due_today = self.task('تحویل امروز', due=when('0', '17:00'))
+        picked = self.task('تماس انتخاب‌شده')
+        self.task('تمرین فردا', due=when('+1'))
+        self.task('خرید بی‌موعد')
+        self.send('دیدار خانوادگی', dict(action='create', kind='event',
+                                        title='دیدار خانوادگی', due=when('0')))
+        self.pick(picked)
+        with self.db:
+            put(self.db, 'tasks_keyboard', '1')
+        self.restart()
+        calls = len(self.router.calls)
+        listing = self.send('کارهای امروز')
+        self.assertIn('تحویل امروز', listing)
+        self.assertIn('تماس انتخاب‌شده', listing)
+        for title in ('تمرین فردا', 'خرید بی‌موعد', 'دیدار خانوادگی'):
+            self.assertNotIn(title, listing)
+        self.assertEqual(self.tg.sent[-1]['reply_markup']['keyboard'],
+                         [[{'text': 'همهٔ کارها'}, {'text': 'کارهای امروز'}]])
+        self.send(f'finish:{due_today}', button=True)
+        self.send(f'finish:{picked}', button=True)
+        self.assertEqual(self.send('کارهای امروز'), 'فعلاً کاری برای امروز نداری.')
         self.assertEqual(len(self.router.calls), calls)
 
     def test_two_days_before_deadline_repeats_until_done(self):

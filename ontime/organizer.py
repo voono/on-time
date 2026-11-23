@@ -54,6 +54,8 @@ def candidate_titles(db, text, now, context):
 def list_page(db, scope, target, page, now, view=None):
     today = now.date()
     week = today - timedelta(days=(today.weekday() - 5) % 7)
+    plan = current_plan(db, today) if scope in ('today', 'today_tasks') else None
+    selected_id = plan['item_id'] if plan else None
     found = []
     for item in active(db):
         if not matches(item, target):
@@ -62,29 +64,32 @@ def list_page(db, scope, target, page, now, view=None):
         keep = {'today': d == today, 'week': bool(d and week <= d < week + timedelta(days=7)),
                 'undated': item['kind'] == 'task' and d is None, 'notes': item['kind'] == 'note',
                 'events': item['kind'] == 'event', 'reminders': item['remind_at'] is not None,
-                'tasks': item['kind'] == 'task', 'all': True}[scope]
+                'tasks': item['kind'] == 'task',
+                'today_tasks': item['kind'] == 'task' and (d == today or item['id'] == selected_id),
+                'all': True}[scope]
         # Explicit reminders also belong in date-based agenda views.
         rday = datetime.fromtimestamp(item['remind_at'], now.tzinfo).date() if item['remind_at'] else None
         if keep or (scope == 'today' and rday == today) or (scope == 'week' and rday and week <= rday < week + timedelta(days=7)):
             found.append((item, d))
     header = ['کارهای بازت'] if scope == 'tasks' and found else []
-    selected_id = None
-    if scope == 'today' and not target:
-        plan = current_plan(db, today)
-        if plan:
-            selected = item_by_id(db, plan['item_id'])
-            header = ['انتخاب امروز: ' + selected['title']]
-            selected_id = selected['id']
+    if scope == 'today_tasks' and found:
+        header = ['کارهای امروز']
+    if scope == 'today' and not target and plan:
+        selected = item_by_id(db, selected_id)
+        header = ['انتخاب امروز: ' + selected['title']]
     if not found and header:
         return message(header[0], context={'ids': [selected_id]})
     if not found:
-        return message('فعلاً کار بازی نداری.' if scope == 'tasks' and not target else 'چیزی با این مشخصات پیدا نکردم.')
+        empty = {'tasks': 'فعلاً کار بازی نداری.', 'today_tasks': 'فعلاً کاری برای امروز نداری.'}
+        return message(empty.get(scope if not target else '', 'چیزی با این مشخصات پیدا نکردم.'))
     found.sort(key=lambda x: (x[1] is None, str(x[1]), x[0]['due_clock'] or '', -x[0]['id']))
     size = 6
     page = min(max(0, page), (len(found) - 1) // size)
     rows, lines, ids = [], header, []
     for item, d in found[page * size:(page + 1) * size]:
         desc = label(d) + (' ' + fa(item['due_clock']) if item['due_clock'] else '') if d else ''
+        if scope == 'today_tasks' and item['id'] == selected_id and not desc:
+            desc = 'انتخاب امروز'
         if item['remind_at']:
             desc += (' · ' if desc else '') + 'یادآوری ' + reminder_label(item, now.tzinfo)
         ids.append(item['id'])
@@ -140,7 +145,8 @@ def local_command(db, text, now):
     cmd, _, arg = norm(text).partition(' ')
     if cmd in ('/start', '/help'):
         return {**message(HELP), 'reply_markup': tasks_keyboard()}
-    scopes = {'/mytasks': 'tasks', '/tasks': 'undated', '/notes': 'notes', '/list': 'all', '/week': 'week', '/today': 'today'}
+    scopes = {'/mytasks': 'tasks', '/todaytasks': 'today_tasks', '/tasks': 'undated', '/notes': 'notes',
+              '/list': 'all', '/week': 'week', '/today': 'today'}
     if cmd in scopes:
         return list_page(db, scopes[cmd], '', 0, now)
     if cmd == '/history':

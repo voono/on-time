@@ -120,5 +120,9 @@ def set_pending(db, data):
     put(db, 'pending', json.dumps(data, ensure_ascii=False))
 
 
+TASKS_KEYBOARD_VERSION = '2'
+
+
 def tasks_keyboard():
-    return {'keyboard': [[{'text': 'کارهای من'}]], 'resize_keyboard': True, 'is_persistent': True}
+    return {'keyboard': [[{'text': 'همهٔ کارها'}, {'text': 'کارهای امروز'}]],
+            'resize_keyboard': True, 'is_persistent': True}

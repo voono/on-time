@@ -9,7 +9,7 @@ from .conversation import conversation_context, shortcut
 from .intent import Intent
 from .organizer import callback, candidate_titles, interpret, local_command
 from .planner import arm, current_plan, morning_due, next_annual, next_daily, reminder_key, scheduled_message
-from .store import connect, enqueue, item_by_id, message, pending, pref, put, tasks_keyboard
+from .store import TASKS_KEYBOARD_VERSION, connect, enqueue, item_by_id, message, pending, pref, put, tasks_keyboard
 from .transport import DeliveryError
 
 LOG = logging.getLogger(__name__)
@@ -178,7 +178,8 @@ class Service:
                 return True
             try:
                 focus = payload.pop('_context', {})
-                if job['kind'] == 'reply' and 'reply_markup' not in payload and not pref(db, 'tasks_keyboard'):
+                if (job['kind'] == 'reply' and 'reply_markup' not in payload
+                        and pref(db, 'tasks_keyboard') != TASKS_KEYBOARD_VERSION):
                     payload['reply_markup'] = tasks_keyboard()
                 sent = self.tg.send(payload)
             except DeliveryError as exc:
@@ -197,7 +198,7 @@ class Service:
                     if 'hint' in focus:
                         db.execute('INSERT OR REPLACE INTO checkin_hints VALUES (?,?,?)', focus.pop('hint'))
                     if 'keyboard' in payload.get('reply_markup', {}):
-                        put(db, 'tasks_keyboard', '1')
+                        put(db, 'tasks_keyboard', TASKS_KEYBOARD_VERSION)
                     db.execute('INSERT OR REPLACE INTO chat_messages VALUES (?,?)',
                                (sent['message_id'], json.dumps(focus)))
                     self.finish(db, job, stamp, 'sent')
