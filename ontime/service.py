@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import deadlines, feedback, nightly
-from .conversation import conversation_context, shortcut
+from .conversation import anchor_reminder, conversation_context, shortcut
 from .intent import Intent
 from .organizer import callback, candidate_titles, interpret, local_command
 from .planner import arm, current_plan, morning_due, next_annual, next_daily, reminder_key, scheduled_message
@@ -104,6 +104,8 @@ class Service:
                     else:
                         if isinstance(route, Intent):
                             intent = route
+                        else:
+                            intent = anchor_reminder(intent, text, received.date())
                         ref = replied_plan(msg)
                         if focus.get('kind') == 'plan':
                             ref = [focus['day'], str(focus['revision'])]

@@ -1,11 +1,14 @@
+import io
+import json
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from ontime.dates import solar_date, solar_parts
-from ontime.intent import Intent
+from ontime.intent import Intent, Router
 from ontime.service import Service
 from ontime.store import connect, item_by_id, pending, put, setup
 from ontime.transport import DeliveryError
@@ -116,7 +119,7 @@ class BotTest(unittest.TestCase):
         self.assertEqual(0, self.db.execute('SELECT count(*) FROM items').fetchone()[0])
         self.assertIn('ساعت', self.tg.sent[-1]['text'])
         self.restart()
-        self.send('ساعت ۹ صبح', dict(action='create', continuation=True, remind=when('+1','09:00')))
+        self.send('ساعت ۹ صبح لطفاً', dict(action='create', continuation=True, remind=when('+1','09:00')))
         self.assertEqual('فردا قبض رو یادم بنداز', self.router.calls[-1][1]['original'])
         self.assertIsNone(item_by_id(self.db, 1)['due_day'])
         self.assertEqual('پرداخت قبض', item_by_id(self.db, 1)['title'])
@@ -127,6 +130,76 @@ class BotTest(unittest.TestCase):
         self.restart()
         self.drain()
         self.assertEqual(1, sum(m['text'] == '⏰ پرداخت قبض' for m in self.tg.sent))
+
+    def test_spoken_relative_reminder_asks_only_for_clock_and_keeps_original_day(self):
+        self.now = self.now.replace(hour=23, minute=58)
+        self.router = self.bot.router = Router('test-key', 'test-model')
+        text = 'پس‌فردا یادم بیار فلان کارو بکنم'
+        content = Intent(action='create', kind='reminder', title='فلان کار', wants_reminder=True,
+                         remind=when('پس‌فردا'), question='چه روز و ساعتی یادت بندازم؟').model_dump_json()
+        body = io.BytesIO(json.dumps({'choices': [{'message': {'content': content}}]}).encode())
+        with patch('ontime.intent.urlopen', return_value=body) as model:
+            question = self.send(text)
+        request = json.loads(model.call_args.args[0].data)
+        context = json.loads(request['messages'][1]['content'])
+        self.assertEqual(context['message'], text)
+        self.assertEqual(question, 'پس‌فردا چه ساعتی یادآوری کنم؟')
+        self.assertEqual(self.db.execute('SELECT count(*) FROM items').fetchone()[0], 0)
+        self.now += timedelta(minutes=5)
+        self.restart()
+        with patch('ontime.intent.urlopen') as model:
+            self.send('ساعت ۹ صبح', reply_to=len(self.tg.sent))
+            model.assert_not_called()
+        saved = item_by_id(self.db, 1)
+        expected = datetime(2026, 11, 23, 9, tzinfo=ZONE)
+        self.assertEqual(saved['remind_at'], expected.timestamp())
+        self.assertIsNone(saved['due_day'])
+        self.assertIsNone(pending(self.db))
+        self.now = expected
+        self.drain()
+        self.assertEqual(1, sum(m['text'] == '⏰ فلان کار' for m in self.tg.sent))
+
+    def test_relative_reminder_spellings_keep_model_clock(self):
+        for i, (word, days) in enumerate([('امروز', 0), ('فردا', 1), ('پسفردا', 2),
+                                          ('پس فردا', 2), ('پس‌فردا', 2)], 1):
+            with self.subTest(word=word):
+                self.send(f'{word} ساعت ۹ صبح یادم بنداز تماس بگیرم',
+                          dict(action='create', kind='reminder', title='تماس', remind=when(word, '09:00')))
+                saved = item_by_id(self.db, i)
+                expected = (self.now + timedelta(days=days)).replace(hour=9)
+                self.assertIsNotNone(saved)
+                self.assertEqual(saved['remind_at'], expected.timestamp())
+
+    def test_relative_reminder_recovers_missing_model_day(self):
+        question = self.send('پس فردا یادم بیار به علی زنگ بزنم',
+                             dict(action='create', kind='reminder', title='تماس با علی',
+                                  wants_reminder=True, question='چه روز و ساعتی؟'))
+        self.assertEqual(question, 'پس‌فردا چه ساعتی یادآوری کنم؟')
+        self.send('فردا ساعت ۹ صبح', dict(action='create', continuation=True, remind=when('+1', '09:00')))
+        expected = (self.now + timedelta(days=1)).replace(hour=9)
+        self.assertEqual(item_by_id(self.db, 1)['remind_at'], expected.timestamp())
+        self.send('پسفردا ساعت ۱۸:۳۰ یادم بیار تماس بگیرم',
+                  dict(action='create', kind='task', title='تماس', wants_reminder=True,
+                       question='چه روز و ساعتی؟'))
+        expected = (self.now + timedelta(days=2)).replace(hour=18, minute=30)
+        self.assertEqual(item_by_id(self.db, 2)['remind_at'], expected.timestamp())
+
+    def test_relative_reminder_uses_local_receipt_day_when_model_crosses_midnight(self):
+        self.send('/tz Asia/Tokyo')
+        zone = ZoneInfo('Asia/Tokyo')
+        self.now = datetime(2026, 11, 21, 14, 59, tzinfo=ZoneInfo('UTC'))
+        parse = self.router.parse
+
+        def parse_after_midnight(text, now, ctx, candidates):
+            self.assertEqual(now, datetime(2026, 11, 21, 23, 59, tzinfo=zone))
+            self.now += timedelta(minutes=2)
+            return parse(text, now, ctx, candidates)
+
+        self.router.parse = parse_after_midnight
+        self.send('پس‌فردا ساعت ۹ صبح یادم بیار تماس بگیرم',
+                  dict(action='create', kind='reminder', title='تماس', remind=when('+2', '09:00')))
+        self.assertEqual(item_by_id(self.db, 1)['remind_at'],
+                         datetime(2026, 11, 23, 9, tzinfo=zone).timestamp())
 
     def test_morning_empty_and_no_unscheduled_delivery(self):
         self.at(8, 29)

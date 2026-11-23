@@ -66,12 +66,24 @@ def clock(value):
     return time(h, m).strftime('%H:%M')
 
 
+def relative_days(value):
+    value = norm(value)
+    if re.fullmatch(r'[+-]\d{1,4}|0', value):
+        return int(value)
+    return {'امروز': 0, 'فردا': 1, 'پس فردا': 2, 'پسفردا': 2}.get(value)
+
+
+def relative_label(days):
+    return {0: 'امروز', 1: 'فردا', 2: 'پس‌فردا'}.get(days)
+
+
 def resolve(spec, today):
     if spec is None:
         return None
+    offset = relative_days(spec.day)
+    if offset is not None:
+        return today + timedelta(days=offset)
     value = norm(spec.day)
-    if re.fullmatch(r'[+-]\d{1,4}|0', value):
-        return today + timedelta(days=int(value))
     try:
         y, m, d = map(int, re.split('[-/]', value))
         return solar_date(y, m, d) if spec.calendar == 'jalali' else date(y, m, d)

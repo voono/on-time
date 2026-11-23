@@ -5,7 +5,7 @@ from functools import partial
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import deadlines, feedback, nightly
-from .dates import WEEKDAYS, clock, fa, instant, label, norm, occurrence, resolve, solar_parts
+from .dates import WEEKDAYS, clock, fa, instant, label, norm, occurrence, relative_label, resolve
 from .intent import Intent
 from .planner import (arm, choose, clear_reminder, close_plan, current_plan, next_annual, next_daily,
                       set_windows)
@@ -268,13 +268,8 @@ def ask(db, text, original, intent, now, **extra):
     draft = intent.model_dump()
     for field in ('due', 'remind'):
         spec = getattr(intent, field)
-        if spec and re.fullmatch(r'[+-]\d{1,4}|0', norm(spec.day)):
-            d = resolve(spec, now.date())
-            if spec.calendar == 'jalali':
-                y, m, day = solar_parts(d)
-                draft[field]['day'] = f'{y:04}-{m:02}-{day:02}'
-            else:
-                draft[field]['day'] = str(d)
+        if spec:
+            draft[field]['day'] = spec.anchored(now.date()).day
     seq = int(pref(db, 'question_seq', '0')) + 1
     put(db, 'question_seq', str(seq))
     set_pending(db, {'original': original, 'at': now.isoformat(), 'draft': draft, 'question_token': seq,
@@ -304,7 +299,11 @@ def save_item(db, intent, original, now, item=None):
         if daily and (not remind or not remind.at):
             question = 'هر روز چه ساعتی یادت بندازم؟'
         elif remind and not remind.at:
-            question = 'برای ' + label(resolve(remind, now.date())) + ' چه ساعتی یادت بندازم؟'
+            day = resolve(remind, now.date())
+            relative = relative_label((day - now.date()).days)
+            question = (f'{relative} چه ساعتی یادآوری کنم؟' if relative
+                        else f'برای {label(day)} چه ساعتی یادت بندازم؟')
+            extra['field'] = 'remind_clock'
         return ask(db, question, original, intent, now, **extra)
     if not creating and not due and not remind:
         return ask(db, 'زمان تازه رو می‌گی؟', original, intent, now, **extra)
@@ -562,6 +561,8 @@ def interpret(db, text, intent, ctx, now, visible=()):
                   daily=old.daily if intent.daily is None else intent.daily,
                   wants_reminder=old.wants_reminder or intent.wants_reminder)
     field = ctx.get('field')
+    if field == 'remind_clock':
+        field = 'remind'
     for name in ('due', 'remind'):
         if field and name != field:
             continue

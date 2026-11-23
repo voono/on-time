@@ -3,7 +3,7 @@ import json
 import re
 
 from .dates import norm
-from .intent import Intent
+from .intent import Intent, When
 
 ORDINALS = ('اول', 'دوم', 'سوم', 'چهارم', 'پنجم', 'ششم', 'هفتم', 'هشتم', 'نهم', 'دهم', 'یازدهم', 'دوازدهم')
 COMMANDS = {'سابقه یادآوری ها': '/history', 'سابقه یادآوری هام': '/history', 'سابقه': '/history',
@@ -15,6 +15,48 @@ COMMANDS = {'سابقه یادآوری ها': '/history', 'سابقه یادآو
             'این هفته چه کارهایی دارم': '/week', 'بی خیال': '/cancel', 'بیخیال': '/cancel', 'انصراف': '/cancel'}
 STATUS = {'انجام شد': 'done', 'انجامش دادم': 'done', 'تموم شد': 'done',
           'بذار برای بعد': 'later', 'امروز ردش کن': 'skip'}
+
+
+LEADING_REMINDER_DAY = re.compile(
+    r'^(پس ?فردا|فردا|امروز)[ ،,:]+(?:(ساعت [^،,]+?) )?یادم (?:بیار|بنداز)\b')
+HOURS = ('یک', 'دو', 'سه', 'چهار', 'پنج', 'شش', 'هفت', 'هشت', 'نه', 'ده', 'یازده', 'دوازده')
+
+
+def anchor_reminder(intent, text, today):
+    remind = intent.remind
+    if (remind is None and intent.action == 'create' and not intent.continuation
+            and (intent.kind == 'reminder' or (intent.kind == 'task' and intent.wants_reminder))
+            and not intent.due and not intent.daily and not intent.annual):
+        match = LEADING_REMINDER_DAY.match(norm(text))
+        if match:
+            remind = When(day=match[1], at=reminder_clock_reply(match[2] or ''))
+            if remind.at:
+                intent = intent.model_copy(update={'question': ''})
+    if remind:
+        return intent.model_copy(update={'remind': remind.anchored(today)})
+    return intent
+
+
+def reminder_clock_reply(text):
+    match = re.fullmatch(r'(?:ساعت )?([0-9]{1,2}):([0-5][0-9])', text)
+    if match and int(match[1]) <= 23:
+        return f'{int(match[1]):02}:{match[2]}'
+    match = re.fullmatch(
+        r'(?:ساعت )?([0-9]{1,2}|' + '|'.join(HOURS)
+        + r')( و نیم)? (صبح|ظهر|بعد از ظهر|بعدازظهر|عصر|شب)', text)
+    if not match:
+        return None
+    hour = int(match[1]) if match[1].isascii() else HOURS.index(match[1]) + 1
+    period = match[3]
+    if (not 1 <= hour <= 12 or (period == 'ظهر' and hour != 12)
+            or (period == 'صبح' and hour == 12) or (period == 'شب' and 1 <= hour <= 5)):
+        return None
+    if period == 'شب' and hour == 12:
+        hour = 0
+    elif period != 'صبح' and hour < 12:
+        hour += 12
+    minute = 30 if match[2] else 0
+    return f'{hour:02}:{minute:02}'
 
 
 def conversation_context(db, msg):
@@ -54,6 +96,11 @@ def shortcut(text, context, draft):
             if 1 <= minutes <= 5256000:
                 return Intent(action='estimate', continuation=True, effort_minutes=minutes)
             return 'invalid_effort'
+    if draft and draft.get('field') == 'remind_clock':
+        at = reminder_clock_reply(value)
+        if at:
+            remind = {**draft['draft']['remind'], 'at': at}
+            return Intent(action=draft['draft']['action'], continuation=True, remind=remind)
     ids = context.get('ids', [])
     kind = context.get('kind')
     if context.get('checkin'):
