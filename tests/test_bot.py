@@ -368,6 +368,10 @@ class BotTest(unittest.TestCase):
                                       daily=True, remind=when('0', '21:00')))
         self.assertIn('هر روز ساعت ۲۱:۰۰', confirmation)
         self.assertIn('هر روز', self.send('/list'))
+        listing = self.send('همهٔ کارها')
+        self.assertIn('خوردن قرص', listing)
+        self.assertIn('هر روز ساعت ۲۱:۰۰', listing)
+        self.assertEqual(self.send('/mytasks'), listing)
         self.at(20, 59)
         alarm = '⏰ خوردن قرص'
         self.assertNotIn(alarm, [m['text'] for m in self.tg.sent])
@@ -389,6 +393,7 @@ class BotTest(unittest.TestCase):
         self.drain()
         self.assertEqual([m['text'] for m in self.tg.sent].count(alarm), 3)
         self.assertIsNone(item_by_id(self.db, 1)['remind_at'])
+        self.assertNotIn('خوردن قرص', self.send('/mytasks'))
 
     def test_daily_clarification_after_clock_and_missed_days(self):
         question = self.send('هر روز یادم بنداز تمرین کنم',
@@ -489,6 +494,9 @@ class BotTest(unittest.TestCase):
         self.task('تحویل گزارش', due=when('+4'))
         self.task('تماس')
         self.send('یادداشت سفر', dict(action='create', kind='note', title='یادداشت سفر'))
+        self.send('تولد مریم', dict(action='create', kind='event', title='تولد مریم', due=when('+2')))
+        self.send('یادآوری قبض', dict(action='create', kind='reminder', title='پرداخت قبض',
+                                    remind=when('+1', '12:00')))
         self.send('/start')
         self.assertEqual(self.tg.sent[-1]['reply_markup']['keyboard'],
                          [[{'text': 'همهٔ کارها'}, {'text': 'کارهای امروز'}]])
@@ -496,9 +504,21 @@ class BotTest(unittest.TestCase):
         listing = self.send('همهٔ کارها')
         self.assertIn('تحویل گزارش', listing)
         self.assertIn('تماس', listing)
+        self.assertIn('پرداخت قبض', listing)
         self.assertNotIn('یادداشت سفر', listing)
+        self.assertNotIn('تولد مریم', listing)
         self.assertIn('تحویل گزارش', self.send('اولی'))
         self.assertEqual(len(self.router.calls), calls)
+
+    def test_help_lists_all_commands_with_the_task_keyboard(self):
+        expected = {'/start', '/help', '/mytasks', '/todaytasks', '/tasks', '/list', '/today', '/week', '/notes',
+                    '/history', '/report', '/cancel', '/settings', '/morning', '/night', '/followup', '/near', '/tz', '/free'}
+        help_text = self.send('/help')
+        self.assertEqual({line.split()[0] for line in help_text.splitlines() if line.startswith('/')}, expected)
+        self.assertEqual(self.tg.sent[-1]['reply_markup']['keyboard'],
+                         [[{'text': 'همهٔ کارها'}, {'text': 'کارهای امروز'}]])
+        self.assertEqual(self.send('/start'), help_text)
+        self.assertFalse(self.router.calls)
 
     def test_today_button_refreshes_old_keyboard_and_lists_only_todays_open_tasks(self):
         due_today = self.task('تحویل امروز', due=when('0', '17:00'))

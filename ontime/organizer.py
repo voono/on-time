@@ -1,6 +1,7 @@
 import json
 import re
 from datetime import datetime, timedelta
+from functools import partial
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import deadlines, feedback, nightly
@@ -11,7 +12,7 @@ from .planner import (arm, choose, clear_reminder, close_plan, current_plan, nex
 from .store import cancel, enqueue, item_by_id, message, pending, pref, put, set_pending, tasks_keyboard
 
 KINDS = {'task': 'کار', 'note': 'یادداشت', 'event': 'مناسبت', 'reminder': 'یادآوری'}
-HELP = """هرچی توی ذهنت هست بنویس. مثلاً «یه وقت به دندون‌پزشک زنگ بزنم» یا «فردا ساعت ۱۰ یادم بنداز قبض رو بدم».
+HELP_INTRO = """هرچی توی ذهنت هست بنویس. مثلاً «یه وقت به دندون‌پزشک زنگ بزنم» یا «فردا ساعت ۱۰ یادم بنداز قبض رو بدم».
 بعدش هم می‌تونی بگی «ساعتش رو عوض کن» یا بپرسی «امروز چه کارهایی دارم؟»"""
 
 
@@ -61,17 +62,18 @@ def list_page(db, scope, target, page, now, view=None):
         if not matches(item, target):
             continue
         d = occurrence(item, week if scope == 'week' else today)
+        has_reminder = item['remind_at'] is not None
         keep = {'today': d == today, 'week': bool(d and week <= d < week + timedelta(days=7)),
                 'undated': item['kind'] == 'task' and d is None, 'notes': item['kind'] == 'note',
-                'events': item['kind'] == 'event', 'reminders': item['remind_at'] is not None,
-                'tasks': item['kind'] == 'task',
+                'events': item['kind'] == 'event', 'reminders': has_reminder,
+                'tasks': item['kind'] == 'task' or (item['kind'] == 'reminder' and has_reminder),
                 'today_tasks': item['kind'] == 'task' and (d == today or item['id'] == selected_id),
                 'all': True}[scope]
         # Explicit reminders also belong in date-based agenda views.
         rday = datetime.fromtimestamp(item['remind_at'], now.tzinfo).date() if item['remind_at'] else None
         if keep or (scope == 'today' and rday == today) or (scope == 'week' and rday and week <= rday < week + timedelta(days=7)):
             found.append((item, d))
-    header = ['کارهای بازت'] if scope == 'tasks' and found else []
+    header = ['کارهای باز و یادآوری‌های فعال'] if scope == 'tasks' and found else []
     if scope == 'today_tasks' and found:
         header = ['کارهای امروز']
     if scope == 'today' and not target and plan:
@@ -80,7 +82,7 @@ def list_page(db, scope, target, page, now, view=None):
     if not found and header:
         return message(header[0], context={'ids': [selected_id]})
     if not found:
-        empty = {'tasks': 'فعلاً کار بازی نداری.', 'today_tasks': 'فعلاً کاری برای امروز نداری.'}
+        empty = {'tasks': 'فعلاً کار باز یا یادآوری فعالی نداری.', 'today_tasks': 'فعلاً کاری برای امروز نداری.'}
         return message(empty.get(scope if not target else '', 'چیزی با این مشخصات پیدا نکردم.'))
     found.sort(key=lambda x: (x[1] is None, str(x[1]), x[0]['due_clock'] or '', -x[0]['id']))
     size = 6
@@ -141,21 +143,22 @@ def detail(db, item, now):
     return message('\n'.join(lines), context={'ids': [i]})
 
 
-def local_command(db, text, now):
-    cmd, _, arg = norm(text).partition(' ')
-    if cmd in ('/start', '/help'):
-        return {**message(HELP), 'reply_markup': tasks_keyboard()}
-    scopes = {'/mytasks': 'tasks', '/todaytasks': 'today_tasks', '/tasks': 'undated', '/notes': 'notes',
-              '/list': 'all', '/week': 'week', '/today': 'today'}
-    if cmd in scopes:
-        return list_page(db, scopes[cmd], '', 0, now)
-    if cmd == '/history':
-        return feedback.history(db, now, arg)
-    if cmd == '/report':
-        return nightly.report(db, now)
-    if cmd == '/cancel':
-        set_pending(db, None)
-        return message('سؤال بسته شد.')
+def help_command(_db, _now, _arg):
+    lines = [HELP_INTRO, '', 'فرمان‌های بات']
+    lines.extend(f'{command}{usage} — {description}' for command, (usage, description, _) in COMMANDS.items())
+    return {**message('\n'.join(lines)), 'reply_markup': tasks_keyboard()}
+
+
+def list_command(db, now, _arg, *, scope):
+    return list_page(db, scope, '', 0, now)
+
+
+def cancel_command(db, _now, _arg):
+    set_pending(db, None)
+    return message('سؤال بسته شد.')
+
+
+def settings_command(db, now, arg, *, cmd):
     if cmd == '/settings':
         return message(f"صبح‌بخیر: {fa(pref(db,'morning'))} ({'روشن' if pref(db,'enabled')=='1' else 'خاموش'})"
                        f"\nجمع‌بندی شب: {fa(pref(db,'night'))} ({'روشن' if pref(db,'night_enabled')=='1' else 'خاموش'})"
@@ -187,7 +190,7 @@ def local_command(db, text, now):
     elif cmd in ('/followup', '/tz'):
         if cmd == '/tz':
             # IANA names are case-sensitive.
-            name = text.strip().split(maxsplit=1)[-1].strip()
+            name = arg
             try:
                 zone = ZoneInfo(name)
             except (ZoneInfoNotFoundError, ValueError):
@@ -215,8 +218,6 @@ def local_command(db, text, now):
             lines.append(name + ': ' + (spans or 'وقت آزاد ندارم'))
         # Weekly pattern + upcoming exceptions fit one message in normal use; allow access to all via date.
         return message('\n'.join(lines)[:3900])
-    else:
-        return message('این دستور را نمی‌شناسم. /help')
     if cmd == '/morning':
         if pref(db, 'enabled') == '0':
             return message('پیام صبح‌بخیر خاموش شد.')
@@ -226,6 +227,41 @@ def local_command(db, text, now):
     if cmd == '/tz':
         return message('منطقهٔ زمانی شد ' + pref(db, 'zone') + '.')
     return message('مناسبت‌های ' + fa(pref(db, 'near')) + ' روز آینده رو نشون می‌دم.')
+
+
+COMMANDS = {
+    '/start': ('', 'شروع و نمایش دکمه‌های فهرست', help_command),
+    '/help': ('', 'نمایش این راهنما', help_command),
+    '/mytasks': ('', 'کارهای باز و یادآوری‌های فعال', partial(list_command, scope='tasks')),
+    '/todaytasks': ('', 'کارهای موعددار یا انتخاب‌شده برای امروز', partial(list_command, scope='today_tasks')),
+    '/tasks': ('', 'کارهای بازِ بی‌موعد', partial(list_command, scope='undated')),
+    '/list': ('', 'همهٔ موارد باز', partial(list_command, scope='all')),
+    '/today': ('', 'موعدها و یادآوری‌های امروز', partial(list_command, scope='today')),
+    '/week': ('', 'موعدها و یادآوری‌های هفتهٔ جاری', partial(list_command, scope='week')),
+    '/notes': ('', 'یادداشت‌ها', partial(list_command, scope='notes')),
+    '/history': (' [امروز یا دیروز] [عنوان]', 'سابقهٔ ثبت نتیجهٔ یادآوری‌ها', feedback.history),
+    '/report': ('', 'جمع‌بندی امروز', lambda db, now, _: nightly.report(db, now)),
+    '/cancel': ('', 'بستن سؤال در جریان', cancel_command),
+    '/settings': ('', 'نمایش تنظیمات فعلی', partial(settings_command, cmd='/settings')),
+    '/morning': (' 08:30 | on | off', 'تنظیم ساعت یا روشن و خاموش کردن پیام صبح', partial(settings_command, cmd='/morning')),
+    '/night': (' 22:30 | on | off', 'تنظیم ساعت یا روشن و خاموش کردن جمع‌بندی شب',
+               partial(settings_command, cmd='/night')),
+    '/followup': (' 19:00', 'تنظیم ساعت پیگیری', partial(settings_command, cmd='/followup')),
+    '/near': (' 7', 'تعداد روزهای نمایش مناسبت‌های نزدیک', partial(settings_command, cmd='/near')),
+    '/tz': (' Asia/Tehran', 'تغییر منطقهٔ زمانی', partial(settings_command, cmd='/tz')),
+    '/free': ('', 'نمایش بازه‌های آزاد ثبت‌شده', partial(settings_command, cmd='/free')),
+}
+
+
+def local_command(db, text, now):
+    cmd, _, arg = norm(text).partition(' ')
+    command = COMMANDS.get(cmd)
+    if command is None:
+        return message('این دستور را نمی‌شناسم. /help')
+    if cmd == '/tz':
+        parts = text.strip().split(maxsplit=1)
+        arg = parts[1] if len(parts) > 1 else ''
+    return command[2](db, now, arg)
 
 
 def ask(db, text, original, intent, now, **extra):
