@@ -67,6 +67,8 @@ class Service:
                 else:
                     ctx = None
             route = None if cb else shortcut(text, focus, ctx)
+            if not cb and not text.startswith('/') and msg.get('reply_to_message') and focus.get('kind') == 'model_setting':
+                route = '/model ' + text
             check_button = bool(cb and cb.get('data', '').startswith('check:'))
             if cb and not check_button:
                 try:
@@ -76,7 +78,9 @@ class Service:
             elif not cb and route is None and not stale_question:
                 try:
                     received = self.local(db)
-                    intent = self.router.parse(text, received, ctx, candidate_titles(db, text, received, focus))
+                    intent = self.router.parse(
+                        text, received, ctx, candidate_titles(db, text, received, focus),
+                        model=pref(db, 'model'))
                 except Exception as exc:
                     LOG.warning('Intent unavailable (%s)', type(exc).__name__)
                     parse_error = True

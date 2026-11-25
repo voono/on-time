@@ -158,12 +158,26 @@ def cancel_command(db, _now, _arg):
     return message('سؤال بسته شد.')
 
 
+def model_command(db, _now, arg):
+    if arg == 'default':
+        db.execute("DELETE FROM settings WHERE key='model'")
+    elif arg:
+        if len(arg) > 200 or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?', arg):
+            raise ValueError('شناسهٔ مدل را مثل openai/gpt-4o-mini بنویس یا default را بفرست.')
+        put(db, 'model', arg)
+    model = pref(db, 'model') or pref(db, 'default_model')
+    return message(f'مدل فعال: {model}', [[('تغییر مدل', 'settings:model')]])
+
+
 def settings_command(db, now, arg, *, cmd):
     if cmd == '/settings':
+        model = pref(db, 'model') or pref(db, 'default_model')
         return message(f"صبح‌بخیر: {fa(pref(db,'morning'))} ({'روشن' if pref(db,'enabled')=='1' else 'خاموش'})"
                        f"\nجمع‌بندی شب: {fa(pref(db,'night'))} ({'روشن' if pref(db,'night_enabled')=='1' else 'خاموش'})"
                        f"\nپیگیری: {fa(pref(db,'follow'))}\nمناسبت‌های نزدیک: {fa(pref(db,'near'))} روز"
-                       f"\nمنطقه: {pref(db,'zone')}\nبرای تغییرش بگو «صبح‌بخیر رو ساعت ۹ بفرست».")
+                       f"\nمنطقه: {pref(db,'zone')}\nمدل هوش مصنوعی: {model}"
+                       "\nبرای تغییر ساعت صبح‌بخیر بگو «صبح‌بخیر رو ساعت ۹ بفرست».",
+                       [[('تغییر مدل', 'settings:model')]])
     if cmd == '/night':
         if arg in ('off', 'خاموش'):
             put(db, 'night_enabled', '0')
@@ -242,6 +256,7 @@ COMMANDS = {
     '/history': (' [امروز یا دیروز] [عنوان]', 'سابقهٔ ثبت نتیجهٔ یادآوری‌ها', feedback.history),
     '/report': ('', 'جمع‌بندی امروز', lambda db, now, _: nightly.report(db, now)),
     '/cancel': ('', 'بستن سؤال در جریان', cancel_command),
+    '/model': (' [provider/model | default]', 'نمایش یا تغییر مدل هوش مصنوعی', model_command),
     '/settings': ('', 'نمایش تنظیمات فعلی', partial(settings_command, cmd='/settings')),
     '/morning': (' 08:30 | on | off', 'تنظیم ساعت یا روشن و خاموش کردن پیام صبح', partial(settings_command, cmd='/morning')),
     '/night': (' 22:30 | on | off', 'تنظیم ساعت یا روشن و خاموش کردن جمع‌بندی شب',
@@ -258,7 +273,7 @@ def local_command(db, text, now):
     command = COMMANDS.get(cmd)
     if command is None:
         return message('این دستور را نمی‌شناسم. /help')
-    if cmd == '/tz':
+    if cmd in ('/tz', '/model'):
         parts = text.strip().split(maxsplit=1)
         arg = parts[1] if len(parts) > 1 else ''
     return command[2](db, now, arg)
@@ -484,6 +499,12 @@ def close_item(db, item, status, now):
 def callback(db, data, now):
     parts = data.split(':')
     action = parts[0]
+    if data == 'settings:model':
+        out = message('شناسهٔ مدل OpenRouter را در پاسخ به این پیام بفرست، مثلاً openai/gpt-4o-mini. '
+                      'مدل باید از JSON Schema پشتیبانی کند. برای برگشت به مدل پیش‌فرض default را بفرست.',
+                      context={'kind': 'model_setting'})
+        out['reply_markup'] = {'force_reply': True}
+        return out
     expired = message('این دکمه برای انتخاب فعلی نیست. /today')
     if action == 'check' and len(parts) == 3 and re.fullmatch(r'[0-9]{1,18}', parts[1]) and parts[2] in ('done', 'missed'):
         out, item = feedback.record(db, int(parts[1]), parts[2], now)

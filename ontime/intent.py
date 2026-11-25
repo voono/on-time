@@ -156,10 +156,10 @@ class Router:
         self.model = model
         self.schema = strict_schema(Intent.model_json_schema())
 
-    def parse(self, text, now, pending, candidates=()):
+    def parse(self, text, now, pending, candidates=(), *, model=None):
         context = {'local_time': now.isoformat(), 'weekday': now.strftime('%A'),
                    'jalali_today': solar_parts(now.date()), 'pending': pending, 'candidates': candidates, 'message': text}
-        body = {'model': self.model, 'messages': [
+        body = {'model': model or self.model, 'messages': [
             {'role': 'system', 'content': SYSTEM},
             {'role': 'user', 'content': json.dumps(context, ensure_ascii=False)}],
             'provider': {'require_parameters': True},

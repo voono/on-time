@@ -25,8 +25,10 @@ class FakeRouter:
     def __init__(self):
         self.answers = {}
         self.calls = []
+        self.last_model = None
 
-    def parse(self, text, now, ctx, candidates):
+    def parse(self, text, now, ctx, candidates, *, model=None):
+        self.last_model = model
         self.calls.append((text, ctx))
         return Intent.model_validate(self.answers[text])
 
@@ -190,7 +192,7 @@ class BotTest(unittest.TestCase):
         self.now = datetime(2026, 11, 21, 14, 59, tzinfo=ZoneInfo('UTC'))
         parse = self.router.parse
 
-        def parse_after_midnight(text, now, ctx, candidates):
+        def parse_after_midnight(text, now, ctx, candidates, *, model=None):
             self.assertEqual(now, datetime(2026, 11, 21, 23, 59, tzinfo=zone))
             self.now += timedelta(minutes=2)
             return parse(text, now, ctx, candidates)
@@ -583,9 +585,31 @@ class BotTest(unittest.TestCase):
         self.assertIn('تحویل گزارش', self.send('اولی'))
         self.assertEqual(len(self.router.calls), calls)
 
+    def test_dashboard_model_override_applies_to_next_request_and_survives_restart(self):
+        self.assertIn('openai/gpt-4o-mini', self.send('/settings'))
+        button = self.tg.sent[-1]['reply_markup']['inline_keyboard'][0][0]
+        self.send(button['callback_data'], button=True)
+        self.assertTrue(self.tg.sent[-1]['reply_markup']['force_reply'])
+        prompt_id = len(self.tg.sent)
+        self.assertIn('openai/gpt-4o-mini', self.send('/model'))
+        self.send('invalid', reply_to=prompt_id)
+        self.assertIn('openai/gpt-4o-mini', self.send('/model'))
+        model = 'vendor/Model:free'
+        self.assertIn(model, self.send(model, reply_to=prompt_id))
+        self.assertFalse(self.router.calls)
+        self.task('کار اول')
+        self.assertEqual(model, self.router.last_model)
+        self.restart()
+        self.assertIn(model, self.send('/settings'))
+        self.task('کار دوم')
+        self.assertEqual(model, self.router.last_model)
+        self.assertIn('openai/gpt-4o-mini', self.send('/model default'))
+        self.task('کار سوم')
+        self.assertIsNone(self.router.last_model)
+
     def test_help_lists_all_commands_with_the_task_keyboard(self):
         expected = {'/start', '/help', '/mytasks', '/todaytasks', '/tasks', '/list', '/today', '/week', '/notes',
-                    '/history', '/report', '/cancel', '/settings', '/morning', '/night', '/followup', '/near', '/tz', '/free'}
+                    '/history', '/report', '/cancel', '/settings', '/model', '/morning', '/night', '/followup', '/near', '/tz', '/free'}
         help_text = self.send('/help')
         self.assertEqual({line.split()[0] for line in help_text.splitlines() if line.startswith('/')}, expected)
         self.assertEqual(self.tg.sent[-1]['reply_markup']['keyboard'],

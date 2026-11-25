@@ -59,7 +59,7 @@ def connect(path):
     return db
 
 
-def setup(path, zone, owner):
+def setup(path, zone, owner, *, default_model='openai/gpt-4o-mini'):
     ZoneInfo(zone)
     Path(path).parent.mkdir(exist_ok=True, parents=True)
     db = connect(path)
@@ -74,6 +74,7 @@ def setup(path, zone, owner):
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (key, value))
         if pref(db, 'owner') != str(owner):
             raise ValueError('شناسهٔ مالک این پایگاه داده با تنظیمات متفاوت است.')
+        put(db, 'default_model', default_model)
     db.close()
 
 

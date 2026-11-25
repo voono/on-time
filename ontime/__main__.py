@@ -29,11 +29,12 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit('یک نسخه از ربات با همین پایگاه داده در حال اجراست.') from None
-        setup(path, os.getenv('BOT_TIMEZONE', 'Asia/Tehran'), owner)
+        model = os.getenv('OPENROUTER_MODEL', 'openai/gpt-4o-mini')
+        setup(path, os.getenv('BOT_TIMEZONE', 'Asia/Tehran'), owner, default_model=model)
         stop = threading.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())
-        router = Router(os.environ['OPENROUTER_API_KEY'], os.getenv('OPENROUTER_MODEL', 'openai/gpt-4o-mini'))
+        router = Router(os.environ['OPENROUTER_API_KEY'], model)
         Service(path, owner, Telegram(os.environ['TELEGRAM_BOT_TOKEN'], owner), router).run(stop)
 
 
